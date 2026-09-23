@@ -13,14 +13,19 @@ from typing import Optional
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.filters import has_completions
+from prompt_toolkit.layout import ConditionalContainer
 from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.layout.margins import Margin
+from prompt_toolkit.layout import Window
+from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.cursor_shapes import CursorShape
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.history import History
+from prompt_toolkit import prompt
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import (
-    CompletionsMenu,
     Float,
     FloatContainer,
     HSplit,
@@ -161,6 +166,19 @@ class Spinner:
         self._thread = None
 
 
+class SpacesMargin(Margin):
+    """Left margin que só escreve N espaços."""
+    def __init__(self, width: int = 2):
+        self.width = width
+
+    def get_width(self, get_ui_content):
+        return self.width
+
+    def create_margin(self, window_render_info, width, height):
+        # Retorna uma lista de fragments, uma por linha visível.
+        blank = " " * width
+        return [("", blank) for _ in range(height)]
+
 # ============================================================
 # Terminal helpers
 # ============================================================
@@ -188,6 +206,34 @@ def get_terminal_width() -> int:
 
 ECHO_DIR = Path.home() / ".echo"
 HISTORY_FILE = ECHO_DIR / "history.jsonl"
+CONFIG_FILE = ECHO_DIR / "config.json"
+
+
+def load_saved_settings() -> dict:
+    # Le ~/.echo/config.json. Retorna {} se nao existir ou estiver invalido.
+    if not CONFIG_FILE.exists():
+        return {}
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"{YELLOW}[Warning] Could not read {CONFIG_FILE}: {exc}{RESET}")
+        return {}
+
+
+def save_settings(config) -> None:
+    # Grava model e workspace atuais em ~/.echo/config.json.
+    data = load_saved_settings()
+    data["model"] = config.model
+    data["workspace"] = str(config.workspace_root)
+    try:
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 # Regex to detect paste placeholders in the buffer text.
 _PASTE_PLACEHOLDER_RE = re.compile(r"\[Pasted text #(\d+) \+\d+ lines\]")
@@ -299,8 +345,12 @@ SLASH_COMMANDS: dict[str, str] = {
     "/help":      "Show available commands and shortcuts",
     "/clear":     "Clear the terminal screen",
     "/model":     "Switch model: /model <name>",
+    "/models":    "List installed models and pick one (arrows + Enter)",
     "/workspace": "Change workspace: /workspace <path>",
     "/stats":     "Show stats from the last execution",
+    "/tree":      "Show workspace directory tree",
+    "/ls":        "List workspace directory contents",
+    "/new":       "Start a new conversation (clear history)",
     "/exit":      "Exit Echo (alias: /quit)",
     "/quit":      "Exit Echo (alias: /exit)",
 }
@@ -332,7 +382,7 @@ def _show_help() -> str:
 # ============================================================
 # Slash command completer (Float-based — does NOT affect layout)
 # ============================================================
-# ⚠️ CRITICAL: Uses reserve_space_for_menu=0 on the BufferControl
+# CRITICAL: Uses reserve_space_for_menu=0 on the BufferControl
 # so the completion dropdown is rendered as a floating overlay (Float)
 # and never pushes the footer down.
 # Ref: prompt_toolkit/shortcuts/prompt.py FloatContainer + CompletionsMenu
@@ -389,11 +439,11 @@ PROMPT_STYLE = Style.from_dict(
         # Uses dim + yellow to make placeholders easy to spot.
         "paste-placeholder": "ansiyellow",
         # Completion menu styling.
-        "completion-menu": "bg:#1e1e1e #d4d4d4",
-        "completion-menu.completion": "bg:#1e1e1e #d4d4d4",
-        "completion-menu.completion.current": "bg:#0e639c #ffffff",
-        "completion-menu.meta.completion": "bg:#252526 #808080",
-        "completion-menu.meta.completion.current": "bg:#094771 #cccccc",
+        "completion-menu":                "bg:default  #d4d4d4",
+        "completion-menu.completion":     "bg:default  #d4d4d4",
+        "completion-menu.completion.current": "bg:default  #ffffff bold",
+        "completion-menu.meta.completion": "bg:default  #808080",
+        "completion-menu.meta.completion.current": "bg:default  #cccccc",
     }
 )
 
@@ -409,9 +459,19 @@ def create_key_bindings(echo_input: "EchoInput") -> KeyBindings:
     def handle_enter(event):
         buffer = event.current_buffer
         text = buffer.text
+        
+        
+        print(repr(text))
 
         if not text.strip():
             return
+
+        # Texto como o usuario digitou (com placeholders de paste), para ecoar no historico.
+        echo_input.last_display = text.strip()
+        
+        
+        # Persist the submitted input so Up/Down can navigate history.
+        buffer.history.append_string(text)
 
         # ── Slash command dispatch ──────────────────────────────────────────
         # Ref: Codex (slash_command.rs) and Agy (slash commands handler).
@@ -442,6 +502,10 @@ def create_key_bindings(echo_input: "EchoInput") -> KeyBindings:
                 buffer.reset()
                 event.app.exit(result=f"\x00/model {arg}")
                 return
+            elif cmd == "/models":
+                buffer.reset()
+                event.app.exit(result="\x00/models")
+                return
             elif cmd == "/workspace":
                 if not arg:
                     buffer.reset()
@@ -450,9 +514,21 @@ def create_key_bindings(echo_input: "EchoInput") -> KeyBindings:
                 buffer.reset()
                 event.app.exit(result=f"\x00/workspace {arg}")
                 return
+            elif cmd in ("/new", "/reset"):
+                buffer.reset()
+                event.app.exit(result="\x00/new")
+                return
             elif cmd == "/stats":
                 buffer.reset()
                 event.app.exit(result="\x00/stats")
+                return
+            elif cmd == "/tree":
+                buffer.reset()
+                event.app.exit(result="\x00/tree")
+                return
+            elif cmd == "/ls":
+                buffer.reset()
+                event.app.exit(result="\x00/ls")
                 return
             else:
                 # Unknown command — show error inline (don't exit).
@@ -524,7 +600,7 @@ def create_key_bindings(echo_input: "EchoInput") -> KeyBindings:
 
     @bindings.add(Keys.BracketedPaste)
     def handle_paste(event):
-        text = event.data
+        text = event.data.replace("\r\n", "\n").replace("\r", "\n")
         line_count = text.count("\n") + 1
         char_count = len(text)
 
@@ -643,6 +719,7 @@ class EchoInput:
         # Cleared on Ctrl+C or after successful submit.
         self.pasted_texts: dict[str, str] = {}
         self.paste_counter: int = 0
+        self.last_display: str = ""
 
         # ── Persistent history ────────────────────────────────────────────
         # JSONL format (not FileHistory) for richer metadata.
@@ -663,7 +740,7 @@ class EchoInput:
         )
 
         # ── Layout construction ───────────────────────────────────────────
-        # ⚠️ LAYOUT RULES (must not be violated):
+        # LAYOUT RULES (must not be violated):
         # 1. prompt_window height=1 (explicit, no Dimension)
         # 2. input_window Dimension(min=1, max=8) + dont_extend_height=True
         # 3. footer is always the last element of the HSplit, never floated
@@ -677,8 +754,9 @@ class EchoInput:
 
         # Line 2: Prompt + Input (VSplit).
         self.prompt_window = Window(
-            FormattedTextControl(lambda: ANSI(f"{GREEN}➜{RESET} {WHITE}${RESET} ")),
-            width=4,  # Visible width of "➜ $ ".
+            # FormattedTextControl(lambda: ANSI(f"{GREEN}➜{RESET} {WHITE}${RESET} ")),
+            # width=4,  # Visible width of "➜ $ ".
+            width=0,  # Set to 0 to hide the prompt; restore to 4 to show "➜ $ ".
             height=1,
             dont_extend_width=True,
         )
@@ -692,17 +770,16 @@ class EchoInput:
                 # reserve_space_for_menu=0: disable space reservation
                 # for the completion menu inside the window. The menu
                 # is rendered as a Float overlay instead.
-                reserve_space_for_menu=0,
             ),
             # get_line_prefix: adds 4-space indent on continuation lines.
             # Ref: Codex (bottom_pane/textarea.rs soft-wrap prefix logic).
             # Ref: Agy (editing/editing.go multi-line prompt continuation).
             # lineno=0 is the first line (has the "➜ $ " prompt_window).
             # lineno>0 are continuation lines — add 4 spaces of indent.
-            get_line_prefix=lambda lineno, wrap_count: "    " if lineno > 0 else "",
+            get_line_prefix=lambda lineno, wrap_count: "",
             wrap_lines=True,
             height=Dimension(min=1, max=8),
-            dont_extend_height=True,  # ⚠️ CRITICAL: prevents HSplit stretch
+            dont_extend_height=True,  # CRITICAL: prevents HSplit stretch
         )
 
         self.input_line = VSplit([self.prompt_window, self.input_window])
@@ -719,27 +796,40 @@ class EchoInput:
             height=1,
         )
 
-        # ── FloatContainer wraps the entire layout ─────────────────────────
-        # ⚠️ CRITICAL: The CompletionsMenu is a Float, NOT part of HSplit.
-        # This guarantees the footer stays pinned regardless of menu size.
-        # Ref: prompt_toolkit/shortcuts/prompt.py lines 649-720 (Float usage).
-        # Ref: Codex command_popup.rs (overlay approach for slash commands).
-        root = FloatContainer(
-            content=HSplit([
-                self.top_separator,
-                self.input_line,
-                self.bottom_separator,
-                self.footer,
-            ]),
-            floats=[
-                Float(
-                    xcursor=True,
-                    ycursor=True,
-                    content=CompletionsMenu(max_height=8, scroll_offset=1),
-                )
-            ],
-        )
+        # ── Root layout (no completions menu here) ─────────────────────────
+        root = HSplit([
+            self.top_separator,
+            self.input_line,
+            # Inline completions menu — sits BETWEEN the input and the
+            # bottom separator. ConditionalContainer only renders it when
+            # has_completions is True, so the layout collapses back to
+            # exactly 4 lines when the menu is closed.
+            #
+            # Ref: Agy dropdown.go (inline suggestion list attached to the
+            # composer, pushing the footer down while open).
+            ConditionalContainer(
+                HSplit([
+                    # Blank spacer line between the input and the menu.
+                    # Matches Agy's dropdown.go behavior (small gap above
+                    # the inline suggestion list).
+                    Window(height=1),
+                    Window(
+                        FormattedTextControl(self._completion_fragments),
+                        dont_extend_height=True,
+                    ),
+                ]),
+                filter=has_completions,
+            ),
+            self.bottom_separator,
+            self.footer,
+        ])
 
+        # ── CompletionsMenu as a Float overlay ──────────────────────────────
+        # CompletionsMenu is itself a container (wraps its own Window), so it
+        # must live inside a Float in a FloatContainer — never wrapped in a
+        # plain Window, and never a direct HSplit child. This is what keeps
+        # the footer pinned: the Float overlays on top without reserving
+        # layout space.
         self.layout = Layout(root)
 
         # ── Application ───────────────────────────────────────────────────
@@ -770,6 +860,7 @@ class EchoInput:
             style=PROMPT_STYLE,
             cursor=CursorShape.BLINKING_BLOCK,
             full_screen=False,
+            erase_when_done=True,
             output=output,
         )
 
@@ -778,6 +869,43 @@ class EchoInput:
         self.app.renderer.cpr_support = CPR_Support.NOT_SUPPORTED
 
         self.layout.focus(self.buffer)
+
+    def _completion_fragments(self):
+        # Menu de sugestoes desenhado a mao: coluna 0, sem padding e sem scrollbar.
+        state = self.buffer.complete_state
+        if not state or not state.completions:
+            return []
+
+        completions = state.completions
+        current = state.complete_index
+        max_rows = 8
+
+        start = 0
+        if current is not None and current >= max_rows:
+            start = current - max_rows + 1
+        visible = completions[start:start + max_rows]
+
+        name_width = max(len(c.display_text) for c in visible)
+        fragments = []
+        for offset, c in enumerate(visible):
+            selected = (start + offset) == current
+            name_style = (
+                "class:completion-menu.completion.current"
+                if selected
+                else "class:completion-menu.completion"
+            )
+            meta_style = (
+                "class:completion-menu.meta.completion.current"
+                if selected
+                else "class:completion-menu.meta.completion"
+            )
+            fragments.append((name_style, c.display_text.ljust(name_width)))
+            meta = c.display_meta_text
+            if meta:
+                fragments.append((meta_style, "   " + meta))
+            if offset < len(visible) - 1:
+                fragments.append(("", "\n"))
+        return fragments
 
     def get_content_width(self) -> int:
         """
@@ -832,78 +960,244 @@ class EchoInput:
 # Slash command execution (REPL-level)
 # ============================================================
 
+def _normalize_model_name(name: str) -> str:
+    # Ollama trata "qwen2.5-coder" e "qwen2.5-coder:latest" como o mesmo modelo.
+    return name if ":" in name else f"{name}:latest"
+
+
+def fetch_installed_models(base_url: str, timeout: float = 5.0) -> list[dict]:
+    # Lista os modelos instalados no Ollama via GET /api/tags.
+    import urllib.request
+
+    url = base_url.rstrip("/").removesuffix("/v1") + "/api/tags"
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+
+    models = [
+        {"name": m.get("name") or m.get("model", ""), "size": m.get("size", 0)}
+        for m in payload.get("models", [])
+    ]
+    models = [m for m in models if m["name"]]
+    return sorted(models, key=lambda m: m["name"].lower())
+
+
+def select_model_interactive(models: list[dict], current: str) -> Optional[str]:
+    # Seletor inline com setas. Retorna o nome escolhido ou None se cancelado.
+    from prompt_toolkit.data_structures import Point
+
+    if not models:
+        return None
+
+    current_norm = _normalize_model_name(current)
+    index = [0]
+    for i, m in enumerate(models):
+        if _normalize_model_name(m["name"]) == current_norm:
+            index[0] = i
+            break
+
+    def render_list():
+        fragments = []
+        last = len(models) - 1
+        for i, m in enumerate(models):
+            selected = i == index[0]
+            is_current = _normalize_model_name(m["name"]) == current_norm
+            marker = "> " if selected else "  "
+            size = f"{m['size'] / 1e9:.1f} GB" if m.get("size") else ""
+            meta = "  ".join(x for x in (size, "(current)" if is_current else "") if x)
+            style = "class:picker.selected" if selected else "class:picker.item"
+            fragments.append((style, f"{marker}{m['name']}"))
+            fragments.append(("class:picker.meta", f"  {meta}" + ("\n" if i < last else "")))
+        return fragments
+
+    # Mesma linha em branco que fica acima do menu de completions do "/".
+    spacer = Window(height=1)
+    hint = Window(
+        FormattedTextControl(
+            [("class:picker.title", "  Up/Down to move, Enter to select, Esc to cancel")]
+        ),
+        height=1,
+    )
+    list_window = Window(
+        FormattedTextControl(
+            render_list,
+            show_cursor=False,
+            get_cursor_position=lambda: Point(0, index[0]),
+        ),
+        height=min(len(models), 12),
+        dont_extend_height=True,
+    )
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    @kb.add("k")
+    def _up(event):
+        index[0] = (index[0] - 1) % len(models)
+        event.app.invalidate()
+
+    @kb.add("down")
+    @kb.add("j")
+    def _down(event):
+        index[0] = (index[0] + 1) % len(models)
+        event.app.invalidate()
+
+    @kb.add("enter")
+    def _select(event):
+        event.app.exit(result=models[index[0]]["name"])
+
+    @kb.add("escape", eager=True)
+    @kb.add("c-c")
+    @kb.add("q")
+    def _cancel(event):
+        event.app.exit(result=None)
+
+    app = Application(
+        layout=Layout(HSplit([spacer, list_window, hint]), focused_element=list_window),
+        key_bindings=kb,
+        style=Style.from_dict(
+            {
+                "picker.title": "#5f5f5f",
+                "picker.item": "#d4d4d4",
+                "picker.selected": "#ffffff bold",
+                "picker.meta": "#808080",
+            }
+        ),
+        full_screen=False,
+        erase_when_done=True,
+    )
+    app.renderer.cpr_support = CPR_Support.NOT_SUPPORTED
+
+    try:
+        return app.run()
+    except (KeyboardInterrupt, EOFError):
+        return None
+
+
 def execute_slash_command(
     cmd_result: str,
     config: EchoConfig,
     last_stats: Optional[str],
-) -> tuple[bool, bool]:
+) -> tuple[bool, bool, bool]:
     """
     Execute a slash command from the REPL loop.
 
-    Returns (should_continue, model_changed):
+    Returns (should_continue, model_changed, workspace_changed):
       - should_continue: True = stay in REPL, False = exit
       - model_changed: True = config.model was updated
+      - workspace_changed: True = config.workspace_root was updated
+        (caller must reload the orchestrator's filesystem tools)
     """
     # Strip the internal \x00 prefix marker.
     payload = cmd_result.lstrip("\x00")
 
     if payload == "/help":
-        print("\n" + _show_help() + "\n")
-        return True, False
+        print("\n" + _show_help())
+        return True, False, False
 
     elif payload == "/clear":
         # Clear terminal screen — same as Codex /clear and Agy /clear.
         sys.stdout.write("\033[2J\033[H")
         sys.stdout.flush()
-        return True, False
+        return True, False, False
 
     elif payload == "/exit":
-        return False, False
+        return False, False, False
 
     elif payload == "/stats":
         if last_stats:
-            print(f"\n{GRAY}[{last_stats}]{RESET}\n")
+            print(f"\n{GRAY}[{last_stats}]{RESET}")
         else:
-            print(f"\n{GRAY}No stats yet.{RESET}\n")
-        return True, False
+            print(f"\n{GRAY}No stats yet.{RESET}")
+        return True, False, False
+
+    elif payload == "/tree":
+          from echo.tools.filesystem import FilesystemToolHandler
+          handler = FilesystemToolHandler(config.workspace_root)
+          print(f"\n{handler.tree('.')}")
+          return True, False, False
+
+    elif payload == "/ls":
+          from echo.tools.filesystem import FilesystemToolHandler
+          handler = FilesystemToolHandler(config.workspace_root)
+          print(f"\n{handler.list_directory('.')}")
+          return True, False, False
+
+    elif payload == "/models":
+        loading = Spinner("Loading models")
+        loading_started = time.perf_counter()
+        print()
+        loading.start()
+        try:
+            models = fetch_installed_models(config.ollama_url)
+            # Mantem o spinner visivel tempo suficiente para ser percebido.
+            remaining = 0.4 - (time.perf_counter() - loading_started)
+            if remaining > 0:
+                time.sleep(remaining)
+        except (OSError, ValueError) as exc:
+            loading.stop()
+            sys.stdout.write("\033[1A")
+            sys.stdout.flush()
+            print(f"\n{RED}Could not list models from {config.ollama_url}: {exc}{RESET}")
+            return True, False, False
+        finally:
+            loading.stop()
+        sys.stdout.write("\033[1A")
+        sys.stdout.flush()
+
+        if not models:
+            print(f"\n{YELLOW}No models installed. Run: ollama pull <name>{RESET}")
+            return True, False, False
+
+        chosen = select_model_interactive(models, config.model)
+        if chosen and _normalize_model_name(chosen) != _normalize_model_name(config.model):
+            config.model = chosen  # type: ignore[attr-defined]
+            save_settings(config)
+            print(f"\n{GREEN}Model switched to: {chosen}{RESET}")
+            return True, True, False
+
+        print(f"\n{GRAY}Model unchanged: {config.model}{RESET}")
+        return True, False, False
 
     elif payload == "/model?":
         print(f"\n{YELLOW}Usage: /model <name>{RESET}")
-        print(f"{GRAY}Current model: {config.model}{RESET}\n")
-        return True, False
+        print(f"{GRAY}Current model: {config.model}{RESET}")
+        return True, False, False
 
     elif payload.startswith("/model "):
         new_model = payload[len("/model "):].strip()
         if new_model:
             config.model = new_model  # type: ignore[attr-defined]
-            print(f"\n{GREEN}Model switched to: {new_model}{RESET}\n")
-            return True, True
-        return True, False
+            save_settings(config)
+            print(f"\n{GREEN}Model switched to: {new_model}{RESET}")
+            return True, True, False
+        return True, False, False
 
     elif payload == "/workspace?":
         print(f"\n{YELLOW}Usage: /workspace <path>{RESET}")
-        print(f"{GRAY}Current workspace: {config.workspace_root}{RESET}\n")
-        return True, False
+        print(f"{GRAY}Current workspace: {config.workspace_root}{RESET}")
+        return True, False, False
 
     elif payload.startswith("/workspace "):
         new_ws = payload[len("/workspace "):].strip()
         new_path = Path(new_ws).expanduser().resolve()
         if new_path.exists() and new_path.is_dir():
             config.workspace_root = new_path  # type: ignore[attr-defined]
-            print(f"\n{GREEN}Workspace changed to: {new_path}{RESET}\n")
+            save_settings(config)
+            print(f"\n{GREEN}Workspace changed to: {new_path}{RESET}")
+            return True, False, True
         else:
-            print(f"\n{RED}Error: '{new_ws}' is not a valid directory.{RESET}\n")
-        return True, False
+            print(f"\n{RED}Error: '{new_ws}' is not a valid directory.{RESET}")
+            return True, False, False
 
     elif payload.startswith("/unknown "):
         unknown_cmd = payload[len("/unknown "):].strip()
         # Extract just the command part.
         cmd_name = unknown_cmd.split()[0] if unknown_cmd else unknown_cmd
         print(f"\n{RED}Unknown command: {cmd_name}{RESET}")
-        print(f"{GRAY}Type /help to see available commands.{RESET}\n")
-        return True, False
+        print(f"{GRAY}Type /help to see available commands.{RESET}")
+        return True, False, False
 
-    return True, False
+    return True, False, False
 
 
 # ============================================================
@@ -942,7 +1236,7 @@ def print_banner(config: Optional[EchoConfig] = None):
 
     if config is not None:
         info_lines.append(f"{GRAY}{config.model} (via Ollama @ {config.ollama_url}){RESET}")
-        info_lines.append(f"{GRAY}workspace: {config.workspace_root}{RESET}")
+        info_lines.append(f"{GRAY}Workspace: {config.workspace_root}{RESET}")
     else:
         info_lines.append(f"{GRAY}Qwen 2.5 3B (via Ollama){RESET}")
         info_lines.append(f"{GRAY}workspace: ./workspace{RESET}")
@@ -965,6 +1259,8 @@ class StreamingUI:
         self.verbose = verbose
         self.spinner = Spinner("Loading")
         self._printing = False
+        self._after_tool = False  # a tool call was just shown
+        self._gap = False         # blank line already printed before the spinner
 
     def reset(self):
         """
@@ -973,30 +1269,136 @@ class StreamingUI:
         """
         self.spinner.stop()
         self._printing = False
+        self._after_tool = False
+        self._gap = False
+
+    def confirm_tool(self, tool_name: str, arguments: dict) -> bool:
+        """Ask the user for confirmation before executing a sensitive tool."""
+        self.spinner.stop()
+
+        if self._printing:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._printing = False
+
+        print()
+
+        if tool_name == "write_file":
+            path = arguments.get("path", "?")
+            content = arguments.get("content", "")
+            size = len(content) if isinstance(content, str) else 0
+
+            print(f"{YELLOW}[Confirm] write_file{RESET}")
+            print(f"{GRAY}  Path: {path}{RESET}")
+            print(f"{GRAY}  Content: {size} characters{RESET}")
+
+        elif tool_name == "edit_file":
+            path = arguments.get("path", "?")
+            old_text = arguments.get("old_text", "")
+            new_text = arguments.get("new_text", "")
+
+            print(f"{YELLOW}[Confirm] edit_file{RESET}")
+            print(f"{GRAY}  Path: {path}{RESET}")
+            print(
+                f"{GRAY}  Change: {len(old_text)} -> "
+                f"{len(new_text)} characters{RESET}"
+            )
+
+        else:
+            print(f"{YELLOW}[Confirm] {tool_name}{RESET}")
+            print(f"{GRAY}  Arguments: {arguments}{RESET}")
+
+        try:
+            answer = prompt(
+                "  Proceed? [y/N] ",
+                default="",
+            )
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return False
+        
+        return answer.strip().lower() in ("y", "yes")
+    
+    
+
+    def _lead(self) -> str:
+        # Quebra de linha inicial, omitida se o gap apos a tool ja foi impresso.
+        if self._gap:
+            self._gap = False
+            return ""
+        return "\n"
 
     def handle_event(self, event_type: str, data: dict):
         if event_type == "run_started":
             self.reset()
         elif event_type == "iteration_started":
+            if self._after_tool:
+                print()
+                self._after_tool = False
+            # A linha do spinner funciona como a linha em branco de separacao:
+            # o proximo texto comeca nela, sem \n extra.
+            self._gap = True
             self.spinner.start("Loading")
         elif event_type == "content_delta":
             self.spinner.stop()
             if not self._printing:
-                sys.stdout.write("\n")
+                sys.stdout.write(self._lead())
                 self._printing = True
             sys.stdout.write(f"{WHITE}{data['delta']}{RESET}")
             sys.stdout.flush()
+
         elif event_type == "tool_call_received":
             self.spinner.stop()
+            lead = self._lead()
+
             if self.verbose:
-                print(f"\n{GRAY}[Tool Call] {data['tool_name']}({data['arguments']}){RESET}")
+                self._after_tool = True
+
+                tool_name = data["tool_name"]
+                arguments = data["arguments"]
+
+                try:
+                    if isinstance(arguments, str):
+                        arguments = json.loads(arguments)
+
+                    formatted_arguments = json.dumps(
+                        arguments,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    formatted_arguments = str(arguments)
+
+
+
+                print(f"{lead}{GRAY}[Tool Call]{RESET}")
+                print(f"{GRAY}{tool_name}({formatted_arguments}){RESET}")
+        
         elif event_type == "tool_call_executed":
             if self.verbose:
                 status = "OK" if data["success"] else "FAILED"
-                print(f"{GRAY}[Tool Executed ({status}) in {data['duration']:.3f}s] -> {data['result']}{RESET}")
+                result_text = str(data["result"])
+                is_tree = data.get("tool_name") == "tree"
+                if not is_tree:
+                    result_lines = result_text.splitlines()
+                    if len(result_lines) > 15:
+                        hidden = len(result_lines) - 15
+                        result_text = "\n".join(result_lines[:15]) + f"\n... (+{hidden} lines hidden)"
+                        
+                        
+                header = f"{GRAY}[Tool Executed ({status}) in {data['duration']:.3f}s]{RESET}"
+
+                if is_tree:
+                    print(f"\n{header}\n{WHITE}{result_text}{RESET}")
+                else:
+                    print(f"\n{header} {GRAY}-> {result_text}{RESET}")
+                    
+                    
+        elif event_type == "workspace_reloaded":
+            print(f"\n{GRAY}[Tools reloaded -> {data['workspace_root']}]{RESET}")
         elif event_type == "error":
             self.spinner.stop()
-            print(f"\n{BOLD}{RED}[Error]{RESET} {data.get('error')}")
+            print(f"\n{self._lead()}{BOLD}{RED}[Error]{RESET} {data.get('error')}")
         elif event_type in ("run_completed", "max_iterations_reached"):
             self.spinner.stop()
             if self._printing:
@@ -1012,7 +1414,7 @@ def main():
     parser = argparse.ArgumentParser(description="Echo — Local AI Support Assistant with Tool Execution")
     parser.add_argument("prompt", nargs="?", default=None, help="User prompt to execute. If omitted, runs in interactive mode.")
     parser.add_argument("--workspace", "-w", default="./workspace", help="Workspace directory path")
-    parser.add_argument("--model", "-m", default="qwen2.5:3b-instruct", help="Ollama model name")
+    parser.add_argument("--model", "-m", default="qwen2.5-coder", help="Ollama model name")
     parser.add_argument("--url", "-u", default="http://localhost:11434", help="Ollama server URL")
     parser.add_argument("--verbose", "-v", action="store_true", default=True, help="Print verbose execution tracing")
     parser.add_argument("--quiet", "-q", action="store_true", help="Disable verbose output")
@@ -1021,10 +1423,29 @@ def main():
     args = parser.parse_args()
     verbose = args.verbose and not args.quiet
 
+    def _passed(*flags):
+        for a in sys.argv[1:]:
+            for f in flags:
+                if a == f or (f.startswith("--") and a.startswith(f + "=")):
+                    return True
+        return False
+
+    saved = load_saved_settings()
+
+    model = args.model
+    if not _passed("--model", "-m") and saved.get("model"):
+        model = saved["model"]
+
+    workspace = args.workspace
+    if not _passed("--workspace", "-w"):
+        saved_ws = saved.get("workspace")
+        if saved_ws and Path(saved_ws).is_dir():
+            workspace = saved_ws
+
     config = EchoConfig(
         ollama_url=args.url,
-        model=args.model,
-        workspace_root=Path(args.workspace).resolve(),
+        model=model,
+        workspace_root=Path(workspace).resolve(),
     )
 
     client = OllamaClient(base_url=config.ollama_url)
@@ -1039,7 +1460,13 @@ def main():
         sys.exit(1)
 
     ui = StreamingUI(verbose=verbose)
-    orchestrator = EchoOrchestrator(config=config, client=client, on_event=ui.handle_event)
+    orchestrator = EchoOrchestrator(
+    config=config,
+    client=client,
+    on_event=ui.handle_event,
+    confirm_tool=ui.confirm_tool,
+)
+    orchestrator.tool_output_visible = verbose
 
     # Non-interactive mode (one-shot).
     if args.prompt:
@@ -1047,6 +1474,7 @@ def main():
             print(f"Workspace: {config.workspace_root}")
             print(f"Model:     {config.model}")
             print(f"Prompt:    {args.prompt}")
+            print()
 
         try:
             result = orchestrator.run(args.prompt)
@@ -1078,17 +1506,39 @@ def main():
                 if not user_input.strip():
                     continue
 
+                # O frame do prompt foi apagado ao enviar; ecoa a entrada no historico.
+                shown = echo_input.last_display or user_input
+                echo_lines = shown.splitlines() or [shown]
+                print(f"{GRAY}> {echo_lines[0]}{RESET}")
+                for extra in echo_lines[1:]:
+                    print(f"{GRAY}  {extra}{RESET}")
+                echo_input.last_display = ""
+
                 # ── Slash command handling ────────────────────────────────
                 # Commands arrive with a \x00 prefix (internal marker set
                 # in handle_enter bindings). The REPL executes them without
                 # sending to the model.
+                if user_input == "\x00/new":
+                    orchestrator.reset_history()
+                    print(f"\n{GREEN}Conversation cleared.{RESET}")
+                    continue
+
                 if user_input.startswith("\x00"):
-                    should_continue, _ = execute_slash_command(
-                        user_input, config, last_stats
+                    should_continue, _model_changed, workspace_changed = (
+                        execute_slash_command(
+                            user_input, config, last_stats
+                        )
                     )
                     if not should_continue:
                         print("Goodbye!")
                         break
+                    if workspace_changed:
+                        # Re-register filesystem tools so they operate on
+                        # the new directory. Without this, list_directory,
+                        # read_file, etc. keep using the old workspace_root.
+                        # Ref: Codex (app_server_session.rs cwd change
+                        # re-initialization) and Agy (store.go reload).
+                        orchestrator.reload_workspace()
                     continue
 
                 # ── Legacy exit keywords ──────────────────────────────────

@@ -33,17 +33,24 @@ class ToolRegistry:
         description: str,
         parameters: Dict[str, Any],
         handler: Callable[..., Any],
+        requires_confirmation: bool = False,
     ) -> None:
         """Register a tool with its OpenAI-compatible JSON schema and host handler."""
         if name in self._tools:
             raise ValueError(f"Tool '{name}' is already registered.")
-        
+
         self._tools[name] = {
             "name": name,
             "description": description,
             "parameters": parameters,
             "handler": handler,
+            "requires_confirmation": requires_confirmation,
         }
+
+    def requires_confirmation(self, tool_name: str) -> bool:
+        """Return whether a tool requires explicit user confirmation."""
+        tool = self._tools.get(tool_name)
+        return bool(tool and tool.get("requires_confirmation", False))
 
     def get_tool_definitions(self) -> List[Dict[str, Any]]:
         """Return OpenAI-compatible tool specifications list."""
@@ -88,7 +95,15 @@ class ToolRegistry:
         if missing:
             return False, None, f"Missing required parameter(s): {', '.join(missing)}"
 
-        # 3. Check parameter types
+        # 3. Reject parameters that are not declared by the schema.
+        unknown = [p for p in args if p not in properties]
+        if unknown:
+            return False, None, (
+                f"Unknown parameter(s): {', '.join(unknown)}. "
+                f"Allowed parameters: {', '.join(properties.keys()) or '(none)'}"
+            )
+
+        # 4. Coerce values to the types declared by the schema.
         type_mapping = {
             "string": (str,),
             "integer": (int,),
@@ -98,24 +113,117 @@ class ToolRegistry:
             "object": (dict,),
         }
 
-        for param_name, val in args.items():
-            if param_name in properties:
-                expected_type_str = properties[param_name].get("type")
-                if expected_type_str and expected_type_str in type_mapping:
-                    expected_types = type_mapping[expected_type_str]
-                    # Note: bool is a subclass of int in Python, handle carefully
-                    if expected_type_str in ("integer", "number") and isinstance(val, bool):
-                        return False, None, (
-                            f"Parameter '{param_name}' expected type '{expected_type_str}', "
-                            f"got boolean value"
-                        )
-                    if not isinstance(val, expected_types):
-                        return False, None, (
-                            f"Parameter '{param_name}' expected type '{expected_type_str}', "
-                            f"got '{type(val).__name__}'"
+        def coerce_value(param_name: str, value: Any, expected_type: str) -> Any:
+            """Safely coerce common JSON/model-generated values to the schema type."""
+            if expected_type not in type_mapping:
+                return value
+
+            # Already the correct type.
+            # bool must be handled separately because bool is an int subclass.
+            if expected_type == "integer":
+                if isinstance(value, bool):
+                    raise ValueError("got boolean value")
+                if isinstance(value, int):
+                    return value
+            elif expected_type == "number":
+                if isinstance(value, bool):
+                    raise ValueError("got boolean value")
+                if isinstance(value, (int, float)):
+                    return value
+            elif expected_type == "boolean":
+                if isinstance(value, bool):
+                    return value
+            elif expected_type == "string":
+                if isinstance(value, str):
+                    return value
+            elif expected_type == "array":
+                if isinstance(value, list):
+                    return value
+            elif expected_type == "object":
+                if isinstance(value, dict):
+                    return value
+
+            # Models sometimes emit scalar values as strings.
+            if isinstance(value, str):
+                stripped = value.strip()
+
+                if expected_type == "integer":
+                    try:
+                        # Do not accept "3.5" as an integer.
+                        parsed = int(stripped)
+                        if stripped not in {str(parsed), f"+{parsed}", f"-{abs(parsed)}"}:
+                            raise ValueError
+                        return parsed
+                    except ValueError:
+                        raise ValueError(
+                            f"could not convert string {value!r} to integer"
                         )
 
-        return True, args, None
+                if expected_type == "number":
+                    try:
+                        parsed = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        raise ValueError(
+                            f"could not convert string {value!r} to number"
+                        )
+
+                    if isinstance(parsed, bool) or not isinstance(parsed, (int, float)):
+                        raise ValueError(
+                            f"could not convert string {value!r} to number"
+                        )
+                    return parsed
+
+                if expected_type == "boolean":
+                    lowered = stripped.lower()
+                    if lowered == "true":
+                        return True
+                    if lowered == "false":
+                        return False
+                    raise ValueError(
+                        f"could not convert string {value!r} to boolean; "
+                        "expected 'true' or 'false'"
+                    )
+
+                if expected_type in ("array", "object"):
+                    try:
+                        parsed = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        raise ValueError(
+                            f"could not parse string {value!r} as JSON "
+                            f"{expected_type}"
+                        )
+
+                    expected_python_type = list if expected_type == "array" else dict
+                    if not isinstance(parsed, expected_python_type):
+                        raise ValueError(
+                            f"JSON value must be a {expected_type}"
+                        )
+                    return parsed
+
+            raise ValueError(
+                f"expected type '{expected_type}', got '{type(value).__name__}'"
+            )
+
+        coerced_args = {}
+
+        for param_name, val in args.items():
+            expected_type_str = properties[param_name].get("type")
+
+            if expected_type_str and expected_type_str in type_mapping:
+                try:
+                    coerced_args[param_name] = coerce_value(
+                        param_name,
+                        val,
+                        expected_type_str,
+                    )
+                except ValueError as e:
+                    return False, None, (
+                        f"Invalid value for parameter '{param_name}': {e}"
+                    )
+            else:
+                coerced_args[param_name] = val
+
+        return True, coerced_args, None
 
     def execute(self, call_id: str, tool_name: str, raw_arguments: str) -> ToolExecutionRecord:
         """Validate and execute a tool call, returning the execution record."""

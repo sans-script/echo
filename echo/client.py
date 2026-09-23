@@ -197,7 +197,8 @@ class OllamaClient:
         usage = None
 
         try:
-            for raw_line in resp.iter_lines(decode_unicode=True):
+            for raw_bytes in resp.iter_lines():
+                raw_line = raw_bytes.decode("utf-8", errors="replace") if isinstance(raw_bytes, bytes) else raw_bytes
                 if not raw_line:
                     continue
 
