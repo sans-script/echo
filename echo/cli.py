@@ -4,6 +4,8 @@ import argparse
 import json
 import re
 import shutil
+import random
+import math
 import sys
 import threading
 import time
@@ -43,6 +45,8 @@ from prompt_toolkit.styles import Style
 from .client import OllamaClient
 from .config import EchoConfig
 from .orchestrator import EchoOrchestrator
+from .logo_frames import ECHO_LOGO, ECHO_LOGO_FRAMES
+from .logo_animation import play as play_logo_animation
 
 
 # ============================================================
@@ -70,22 +74,6 @@ CURSOR_HIDE = "\033[?25l"
 
 # Restore cursor to visible + default shape when leaving the REPL.
 CURSOR_RESTORE = "\033[?25h\033[0 q"
-
-
-# ============================================================
-# Echo logo
-# ============================================================
-
-ECHO_LOGO = [
-    "         ::::::     ",
-    "      :::     ::    ",
-    "     :::     :::    ",
-    "    ::::::::::      ",
-    "    :::             ",
-    "    :::        :    ",
-    "    :::      :::    ",
-    "      :::::::       ",
-]
 
 
 # ============================================================
@@ -350,6 +338,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/stats":     "Show stats from the last execution",
     "/tree":      "Show workspace directory tree",
     "/ls":        "List workspace directory contents",
+    "/logo":      "Replay the Echo logo animation",
     "/new":       "Start a new conversation (clear history)",
     "/exit":      "Exit Echo (alias: /quit)",
     "/quit":      "Exit Echo (alias: /exit)",
@@ -530,6 +519,10 @@ def create_key_bindings(echo_input: "EchoInput") -> KeyBindings:
                 buffer.reset()
                 event.app.exit(result="\x00/ls")
                 return
+            elif cmd == "/logo":
+                buffer.reset()
+                event.app.exit(result="\x00/logo")
+                return
             else:
                 # Unknown command — show error inline (don't exit).
                 # The REPL loop will display it after exit(result=...).
@@ -571,6 +564,8 @@ def create_key_bindings(echo_input: "EchoInput") -> KeyBindings:
             echo_input.pasted_texts.clear()
             echo_input.paste_counter = 0
         else:
+            # Preserve the current terminal contents when leaving on Ctrl+C.
+            event.app.erase_when_done = False
             event.app.exit(exception=KeyboardInterrupt)
 
     @bindings.add("c-d")
@@ -640,58 +635,159 @@ def _expand_paste_placeholders(text: str, pasted_texts: dict[str, str]) -> str:
     return _PASTE_PLACEHOLDER_RE.sub(replace_match, text)
 
 
-def create_blinking_output():
-    """
-    Create a native prompt_toolkit VT100 output and replace the
-    default `show_cursor()` behavior.
-
-    ─────────────────────────────────────────────────────────────
-    THE BUG (source: prompt_toolkit/output/vt100.py, line ~670):
-
-        def show_cursor(self) -> None:
-            if self._cursor_visible in (False, None):
-                self._cursor_visible = True
-                # Stop blinking cursor and show.
-                self.write_raw("\\x1b[?12l\\x1b[?25h")
-
-    The `\\x1b[?12l` (ATT160 Reset) DISABLES the cursor blink.
-    It is sent on every redraw, overriding any previous
-    `\\x1b[1 q` (blinking block).
-
-    Since `set_cursor_shape()` is only called when the SHAPE
-    changes (renderer.py, lines 718-724), from the second frame
-    onward only `\\x1b[?12l\\x1b[?25h` is sent — killing the blink.
-
-    ─────────────────────────────────────────────────────────────
-    THE FIX:
-
-    We replace `show_cursor()` with a version that sends:
-
-        \\x1b[?12h  → ATT160 Set: ENABLES cursor blink
-        \\x1b[?25h  → Show cursor
-        \\x1b[1 q   → DECSCUSR 1: cursor = Blinking Block
-
-    Thus, on EVERY render, the cursor is actively reaffirmed as a
-    blinking block. Works on WSL + Windows Terminal and on any
-    modern xterm.
-    """
+def create_cursorless_output():
+    """Keep the physical terminal cursor hidden during prompt_toolkit redraws."""
     output = create_output()
 
     if isinstance(output, Vt100_Output):
-        def _show_cursor() -> None:
-            # Same condition as the original: only write if the cursor
-            # is not already marked as visible.
-            if output._cursor_visible in (False, None):
-                output._cursor_visible = True
-                # \x1b[?12h: enable blink (ATT160 Set)
-                # \x1b[?25h: show cursor
-                # \x1b[1 q : cursor as blinking block (DECSCUSR)
-                output.write_raw("\x1b[?12h\x1b[?25h\x1b[1 q")
+        # The software cursor is rendered by BlinkingCursorBufferControl.
+        # The physical cursor must stay hidden, otherwise every logo
+        # animation invalidate() can interfere with its native blink.
+        output.write_raw("\033[?25l")
+        output._cursor_visible = False
 
+        def _hide_cursor() -> None:
+            output._cursor_visible = False
+
+        def _show_cursor() -> None:
+            output._cursor_visible = False
+
+        output.hide_cursor = _hide_cursor
         output.show_cursor = _show_cursor
 
     return output
 
+
+class FakeCursorBlink:
+    """Software blinking cursor independent of terminal cursor state."""
+
+    def __init__(self, interval: float = 0.53, typing_hold: float = 0.55):
+        self.interval = interval
+        self.typing_hold = typing_hold
+        self.visible = True
+        self._typing_until = 0.0
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._app: Optional[Application] = None
+        self._lock = threading.Lock()
+
+    def start(self, app: Application) -> None:
+        self.stop()
+        with self._lock:
+            self._app = app
+            self.visible = True
+            self._typing_until = 0.0
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._run,
+                daemon=True,
+                name="echo-fake-cursor",
+            )
+            self._thread.start()
+        app.invalidate()
+
+    def mark_typing(self) -> None:
+        """Keep the fake cursor solid while text is actively being edited."""
+        with self._lock:
+            self.visible = True
+            self._typing_until = time.perf_counter() + self.typing_hold
+            app = self._app
+
+        if app is not None:
+            try:
+                app.invalidate()
+            except Exception:
+                pass
+
+    def resume_blinking(self) -> None:
+        with self._lock:
+            self._typing_until = 0.0
+            self.visible = True
+            app = self._app
+
+        if app is not None:
+            try:
+                app.invalidate()
+            except Exception:
+                pass
+
+    def _run(self) -> None:
+        next_toggle = time.perf_counter() + self.interval
+
+        while not self._stop_event.wait(0.04):
+            now = time.perf_counter()
+
+            with self._lock:
+                typing = now < self._typing_until
+
+                if typing:
+                    # While typing, the cursor is always solid and the normal
+                    # blink schedule is restarted from the end of the typing
+                    # hold window.
+                    self.visible = True
+                    next_toggle = now + self.interval
+                elif now >= next_toggle:
+                    self.visible = not self.visible
+                    next_toggle = now + self.interval
+
+                app = self._app
+
+            if app is not None:
+                try:
+                    app.invalidate()
+                except Exception:
+                    pass
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=1.0)
+
+        with self._lock:
+            self._thread = None
+            self._app = None
+            self.visible = True
+            self._typing_until = 0.0
+
+
+class BlinkingCursorBufferControl(BufferControl):
+    """Render a software cursor at the real buffer cursor position."""
+
+    def __init__(self, *args, cursor_blink: FakeCursorBlink, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cursor_blink = cursor_blink
+
+    def create_content(self, width: int, height: int, preview_search: bool = False):
+        content = super().create_content(width, height, preview_search)
+        cursor = content.cursor_position
+        original_get_line = content.get_line
+
+        def get_line(lineno: int):
+            fragments = list(original_get_line(lineno))
+
+            if lineno != cursor.y or not self._cursor_blink.visible:
+                return fragments
+
+            chars: list[tuple[str, str]] = []
+            for style, text in fragments:
+                for char in text:
+                    chars.append((style, char))
+
+            # The cursor can sit one position beyond the last character.
+            # Extend the rendered line so the software cursor is visible
+            # even when the input buffer is empty.
+            if cursor.x >= len(chars):
+                chars.extend(
+                    [("", " ")] * (cursor.x - len(chars) + 1)
+                )
+
+            chars[cursor.x] = ("class:fake-cursor", "█")
+            return chars
+
+        content.get_line = get_line
+        content.show_cursor = False
+        return content
 
 class EchoInput:
     """
@@ -709,8 +805,13 @@ class EchoInput:
     - Slash command autocomplete via Float/CompletionsMenu overlay.
     - Paste placeholder support for large pastes.
     """
-    def __init__(self, config: EchoConfig):
+    def __init__(self, config: EchoConfig, animate_logo: bool = True):
         self.config = config
+        self._cursor_blink = FakeCursorBlink()
+        self.logo_animator = LogoAnimator(
+            config,
+            enabled=animate_logo and sys.stdout.isatty(),
+        )
 
         # ── Paste placeholder state ──────────────────────────────────────
         # Ref: Codex (chat_composer.rs pending_pastes, PasteBurst).
@@ -738,6 +839,7 @@ class EchoInput:
             # This avoids layout jitter from spurious completion events.
             complete_while_typing=True,
         )
+        self.buffer.on_text_changed += lambda _buffer: self._cursor_blink.mark_typing()
 
         # ── Layout construction ───────────────────────────────────────────
         # LAYOUT RULES (must not be violated):
@@ -745,6 +847,15 @@ class EchoInput:
         # 2. input_window Dimension(min=1, max=8) + dont_extend_height=True
         # 3. footer is always the last element of the HSplit, never floated
         # 4. CompletionsMenu is a FLOAT — never part of HSplit
+
+        # Animated banner. The logo is part of the prompt_toolkit layout,
+        # so frame updates do not write directly to stdout and cannot corrupt
+        # the prompt.
+        self.logo_window = Window(
+            FormattedTextControl(self._logo_fragments),
+            height=len(ECHO_LOGO),
+            dont_extend_height=True,
+        )
 
         # Line 1: Top separator.
         self.top_separator = Window(
@@ -765,8 +876,9 @@ class EchoInput:
         # does NOT push the footer down — it floats instead.
         # Ref: prompt_toolkit/shortcuts/prompt.py FloatContainer pattern.
         self.input_window = Window(
-            BufferControl(
+            BlinkingCursorBufferControl(
                 buffer=self.buffer,
+                cursor_blink=self._cursor_blink,
                 # reserve_space_for_menu=0: disable space reservation
                 # for the completion menu inside the window. The menu
                 # is rendered as a Float overlay instead.
@@ -798,6 +910,7 @@ class EchoInput:
 
         # ── Root layout (no completions menu here) ─────────────────────────
         root = HSplit([
+            self.logo_window,
             self.top_separator,
             self.input_line,
             # Inline completions menu — sits BETWEEN the input and the
@@ -853,12 +966,12 @@ class EchoInput:
         # This makes request_absolute_cursor_position() use a fallback path
         # (relative cursor movement) that is WSL-safe. Combined with
         # renderer.reset() on resize, this eliminates the ghost frame.
-        output = create_blinking_output()
+        output = create_cursorless_output()
         self.app = Application(
             layout=self.layout,
             key_bindings=create_key_bindings(self),
             style=PROMPT_STYLE,
-            cursor=CursorShape.BLINKING_BLOCK,
+            cursor=CursorShape._NEVER_CHANGE,
             full_screen=False,
             erase_when_done=True,
             output=output,
@@ -869,6 +982,21 @@ class EchoInput:
         self.app.renderer.cpr_support = CPR_Support.NOT_SUPPORTED
 
         self.layout.focus(self.buffer)
+
+        # Start the logo animation immediately. The prompt_toolkit application
+        # renders the prompt and animated banner together, so there is no
+        # startup animation delay before the prompt becomes usable.
+        self.start_logo_animation()
+
+    def _logo_fragments(self):
+        # FormattedTextControl accepts ANSI-formatted text directly.
+        return ANSI("\n".join(self.logo_animator.current_lines()))
+
+    def start_logo_animation(self):
+        self.logo_animator.start(self.app)
+
+    def stop_logo_animation(self):
+        self.logo_animator.stop()
 
     def _completion_fragments(self):
         # Menu de sugestoes desenhado a mao: coluna 0, sem padding e sem scrollbar.
@@ -937,19 +1065,13 @@ class EchoInput:
         self.pasted_texts.clear()
         self.paste_counter = 0
 
-        result = self.app.run()
+        self._cursor_blink.start(self.app)
+        try:
+            result = self.app.run()
+        finally:
+            self._cursor_blink.stop()
 
-        # ----------------------------------------------------
-        # HIDE the cursor when leaving the prompt.
-        #
-        # All streaming of the model response happens via
-        # sys.stdout.write directly. If the cursor remains visible,
-        # it will "follow" the text being printed.
-        #
-        # When prompt() is called again, the custom show_cursor()
-        # (via Vt100_Output) will automatically reactivate the
-        # blinking cursor.
-        # ----------------------------------------------------
+        # Keep the physical cursor hidden while model output is streamed.
         sys.stdout.write(CURSOR_HIDE)
         sys.stdout.flush()
 
@@ -1122,6 +1244,11 @@ def execute_slash_command(
           print(f"\n{handler.list_directory('.')}")
           return True, False, False
 
+    elif payload == "/logo":
+        print()
+        play_logo_animation("rotation")
+        return True, False, False
+
     elif payload == "/models":
         loading = Spinner("Loading models")
         loading_started = time.perf_counter()
@@ -1225,29 +1352,551 @@ def format_stats(result) -> str:
 
 
 # ============================================================
-# Banner
+# Banner / live random logo animation
 # ============================================================
 
-def print_banner(config: Optional[EchoConfig] = None):
+LOGO_ANIMATION_FPS = 30
+
+
+def _banner_info_lines(config: Optional[EchoConfig]) -> list[str]:
     info_lines = [
         f"{BOLD}{WHITE}Echo CLI 0.1.0{RESET}",
         f"{GRAY}Local AI Support Assistant{RESET}",
     ]
-
     if config is not None:
-        info_lines.append(f"{GRAY}{config.model} (via Ollama @ {config.ollama_url}){RESET}")
-        info_lines.append(f"{GRAY}Workspace: {config.workspace_root}{RESET}")
+        info_lines.append(
+            f"{GRAY}{config.model} (via Ollama @ {config.ollama_url}){RESET}"
+        )
+        info_lines.append(
+            f"{GRAY}Workspace: {config.workspace_root}{RESET}"
+        )
     else:
         info_lines.append(f"{GRAY}Qwen 2.5 3B (via Ollama){RESET}")
         info_lines.append(f"{GRAY}workspace: ./workspace{RESET}")
 
     logo_height = len(ECHO_LOGO)
-    padded_info = info_lines + [""] * max(logo_height - len(info_lines), 0)
+    return info_lines + [""] * max(logo_height - len(info_lines), 0)
 
-    print()
-    for logo_line, info_line in zip(ECHO_LOGO, padded_info):
-        print(f"  {WHITE}{logo_line}{RESET}   {info_line}")
-    print()
+
+class LogoAnimator:
+    """
+    Live random logo animator.
+
+    The animation is rendered INSIDE prompt_toolkit instead of writing to
+    stdout from a background thread. This keeps the logo animation and the
+    input prompt synchronized and prevents the animation from corrupting the
+    prompt_toolkit layout.
+
+    The available effects are:
+      - rotation     : validated ECHO_LOGO_FRAMES
+      - particles    : procedural particle dispersion/convergence
+      - materialize  : progressive construction of the logo
+      - glitch       : short video-artifact bursts
+
+    A different effect is selected after each completed effect, with no
+    immediate repetition. The thread runs continuously for the lifetime of
+    the input application.
+    """
+
+    def __init__(
+        self,
+        config: Optional[EchoConfig] = None,
+        fps: int = LOGO_ANIMATION_FPS,
+        enabled: bool = True,
+    ):
+        self.config = config
+        self.fps = fps
+        self.enabled = enabled
+        self.logo_height = len(ECHO_LOGO)
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._app: Optional[Application] = None
+        self._last_animation: Optional[str] = None
+        self._frame_lock = threading.Lock()
+        self._frame: list[str] = list(ECHO_LOGO)
+        self._points = [
+            (x, y)
+            for y, row in enumerate(ECHO_LOGO)
+            for x, char in enumerate(row)
+            if char == ":"
+        ]
+
+    def _compose(self, logo_frame: list[str]) -> list[str]:
+        padded_info = _banner_info_lines(self.config)
+        return [
+            f"  {WHITE}{logo_line}{RESET}   {info_line}"
+            for logo_line, info_line in zip(logo_frame, padded_info)
+        ]
+
+    def current_lines(self) -> list[str]:
+        with self._frame_lock:
+            frame = list(self._frame)
+        return self._compose(frame)
+
+    def set_frame(self, frame: list[str]) -> None:
+        with self._frame_lock:
+            self._frame = list(frame)
+        app = self._app
+        if app is not None:
+            try:
+                app.invalidate()
+            except Exception:
+                pass
+
+    def _sleep_frame(self, fps: Optional[int] = None) -> bool:
+        return not self._stop_event.wait(1.0 / (fps or self.fps))
+
+    def _render(self, frame: list[str]) -> bool:
+        if self._stop_event.is_set():
+            return False
+        self.set_frame(frame)
+        return True
+
+    def _render_colored(self, frame: list[str]) -> bool:
+        return self._render(frame)
+
+    def _rotation(self) -> None:
+        for frame in ECHO_LOGO_FRAMES:
+            if not self._render_colored(frame):
+                return
+            if not self._sleep_frame():
+                return
+
+    def _particle_frame(self, positions, brightness: float) -> list[str]:
+        width = len(ECHO_LOGO[0])
+        grid = [[" " for _ in range(width)] for _ in range(self.logo_height)]
+        for x, y in positions:
+            ix, iy = round(x), round(y)
+            if 0 <= ix < width and 0 <= iy < self.logo_height:
+                grid[iy][ix] = ":"
+        color = WHITE if brightness >= 0.80 else GRAY if brightness >= 0.55 else DARK
+        return [
+            "".join(f"{color}:{RESET}" if char == ":" else char for char in row)
+            for row in grid
+        ]
+
+    def _particles(self) -> None:
+        rng = random.Random()
+        cx = sum(x for x, _ in self._points) / len(self._points)
+        cy = sum(y for _, y in self._points) / len(self._points)
+        data = []
+
+        for x, y in self._points:
+            data.append({
+                "x": x,
+                "y": y,
+                "angle": math.atan2(y - cy, x - cx),
+                "radius": rng.uniform(3.0, 7.0),
+                "speed": rng.uniform(0.7, 1.3),
+                "phase": rng.uniform(0.0, math.tau),
+                "drift": rng.uniform(0.10, 0.40),
+            })
+
+        for _ in range(8):
+            if self._stop_event.is_set():
+                return
+            if not self._render(ECHO_LOGO):
+                return
+            if not self._sleep_frame():
+                return
+
+        for i in range(26):
+            if self._stop_event.is_set():
+                return
+            t = i / 25.0
+            t = t * t * (3.0 - 2.0 * t)
+            positions = []
+
+            for p in data:
+                radius = p["radius"] * t
+                tx = (
+                    cx
+                    + math.cos(p["angle"]) * radius
+                    + math.sin(i * 0.17 + p["phase"]) * p["drift"] * t
+                )
+                ty = (
+                    cy
+                    + math.sin(p["angle"]) * radius * 0.65
+                    + math.cos(i * 0.13 + p["phase"]) * p["drift"] * t
+                )
+                positions.append((
+                    p["x"] * (1.0 - t) + tx * t,
+                    p["y"] * (1.0 - t) + ty * t,
+                ))
+
+            if not self._render(self._particle_frame(positions, 1.0 - t * 0.25)):
+                return
+            if not self._sleep_frame():
+                return
+
+        for i in range(42):
+            if self._stop_event.is_set():
+                return
+            positions = []
+
+            for p in data:
+                angle = p["angle"] + i * 0.025 * p["speed"]
+                radius = p["radius"] + math.sin(i * 0.10 + p["phase"]) * 0.45
+                positions.append((
+                    cx
+                    + math.cos(angle) * radius
+                    + math.sin(i * 0.07 + p["phase"]) * 0.20,
+                    cy
+                    + math.sin(angle) * radius * 0.65
+                    + math.cos(i * 0.11 + p["phase"]) * 0.20,
+                ))
+
+            if not self._render(self._particle_frame(positions, 0.85)):
+                return
+            if not self._sleep_frame():
+                return
+
+        for i in range(30):
+            if self._stop_event.is_set():
+                return
+            t = i / 29.0
+            t = t * t * (3.0 - 2.0 * t)
+            positions = []
+
+            for p in data:
+                angle = p["angle"] + 42 * 0.025 * p["speed"]
+                radius = p["radius"] * (1.0 - t)
+                ox = cx + math.cos(angle) * radius
+                oy = cy + math.sin(angle) * radius * 0.65
+                positions.append((
+                    ox * (1.0 - t) + p["x"] * t,
+                    oy * (1.0 - t) + p["y"] * t,
+                ))
+
+            if not self._render(self._particle_frame(positions, 0.55 + t * 0.45)):
+                return
+            if not self._sleep_frame():
+                return
+
+        for _ in range(8):
+            if self._stop_event.is_set():
+                return
+            if not self._render(ECHO_LOGO):
+                return
+            if not self._sleep_frame():
+                return
+
+    def _materialize(self) -> None:
+        rng = random.Random()
+        points = self._points[:]
+        rng.shuffle(points)
+        current = set()
+        empty = [" " * len(row) for row in ECHO_LOGO]
+
+        for _ in range(8):
+            if self._stop_event.is_set():
+                return
+            if not self._render(empty):
+                return
+            if not self._sleep_frame():
+                return
+
+        for x, y in points:
+            if self._stop_event.is_set():
+                return
+            current.add((x, y))
+            frame = []
+
+            for yy, row in enumerate(ECHO_LOGO):
+                frame.append("".join(
+                    ":" if char == ":" and (xx, yy) in current else " "
+                    for xx, char in enumerate(row)
+                ))
+
+            if not self._render(frame):
+                return
+            if not self._sleep_frame():
+                return
+
+        for _ in range(12):
+            if self._stop_event.is_set():
+                return
+            if not self._render(ECHO_LOGO):
+                return
+            if not self._sleep_frame():
+                return
+
+    def _glitch_frame(self):
+        result = []
+        shift = random.choice([-3, -2, -1, 1, 2, 3])
+
+        for row in ECHO_LOGO:
+            if random.random() < 0.45:
+                result.append(row)
+                continue
+
+            shifted = [" "] * len(row)
+
+            for x, char in enumerate(row):
+                new_x = x + shift
+                if 0 <= new_x < len(row) and char == ":":
+                    shifted[new_x] = ":"
+
+            for _ in range(random.randint(1, 3)):
+                x = random.randrange(len(row))
+                if shifted[x] == ":":
+                    shifted[x] = random.choice(["·", "░", "▒", "▓"])
+
+            if random.random() < 0.25:
+                start = random.randrange(len(row))
+                length = random.randint(1, 4)
+                for x in range(start, min(start + length, len(row))):
+                    shifted[x] = " "
+
+            result.append("".join(shifted))
+
+        glitch_colors = (
+            "[38;2;255;70;70m",
+            "[38;2;0;240;255m",
+            "[38;2;255;0;180m",
+            "[38;2;90;140;255m",
+        )
+
+        colored = []
+        for row in result:
+            line = []
+            for char in row:
+                if char in (":", "·", "░", "▒", "▓") and random.random() < 0.38:
+                    line.append(f"{random.choice(glitch_colors)}{char}{WHITE}")
+                else:
+                    line.append(char)
+            colored.append("".join(line))
+
+        return colored
+
+    def _glitch(self) -> None:
+        for _ in range(18):
+            if self._stop_event.is_set():
+                return
+            if not self._render(ECHO_LOGO):
+                return
+            if not self._sleep_frame():
+                return
+
+        for _ in range(7):
+            if self._stop_event.is_set():
+                return
+
+            for _ in range(random.randint(7, 15)):
+                if self._stop_event.is_set():
+                    return
+                if not self._render(ECHO_LOGO):
+                    return
+                if not self._sleep_frame():
+                    return
+
+            for _ in range(random.randint(2, 5)):
+                if self._stop_event.is_set():
+                    return
+                if not self._render(self._glitch_frame()):
+                    return
+                if not self._sleep_frame():
+                    return
+
+        for _ in range(12):
+            if self._stop_event.is_set():
+                return
+            if not self._render(ECHO_LOGO):
+                return
+            if not self._sleep_frame():
+                return
+
+    # --------------------------------------------------------
+    # Tetris speed-build
+    # --------------------------------------------------------
+
+    def _tetris_frame(self, locked: set[tuple[int, int]],
+                      falling: list[tuple[int, int, str]] | None = None) -> list[str]:
+        """
+        Render one Tetris frame inside the same 8-line logo viewport.
+
+        The falling pieces use a fixed velocity trail:
+
+            ·
+            ░
+            ▒
+            ▓
+
+        The actual target cells are taken from ECHO_LOGO and are locked as
+        ':' when the piece reaches its destination. This keeps the speed-run
+        effect while guaranteeing that the final image is the real logo.
+        """
+        grid = [[" " for _ in row] for row in ECHO_LOGO]
+
+        for x, y in locked:
+            if 0 <= y < self.logo_height and 0 <= x < len(ECHO_LOGO[0]):
+                grid[y][x] = ":"
+
+        if falling:
+            for x, y, char in falling:
+                if 0 <= y < self.logo_height and 0 <= x < len(ECHO_LOGO[0]):
+                    grid[y][x] = char
+
+        rendered = []
+        for row in grid:
+            rendered.append(
+                "".join(
+                    f"{WHITE}:{RESET}" if c == ":" else
+                    f"{WHITE}▓{RESET}" if c == "▓" else
+                    f"{GRAY}▒{RESET}" if c == "▒" else
+                    f"{GRAY}░{RESET}" if c == "░" else
+                    f"{GRAY}·{RESET}" if c == "·" else
+                    c
+                    for c in row
+                )
+            )
+        return rendered
+
+    def _tetris(self) -> None:
+        """
+        Build the real logo from bottom to top, one tiny piece at a time.
+
+        The fall is intentionally extremely fast. The eye should mostly see
+        a stream of fragments assembling the logo, rather than recognizable
+        tetromino shapes.
+        """
+        rng = random.Random()
+
+        # Exact target cells, grouped by row. We process rows bottom -> top.
+        rows = {
+            y: [x for x, char in enumerate(row) if char == ":"]
+            for y, row in enumerate(ECHO_LOGO)
+        }
+
+        locked: set[tuple[int, int]] = set()
+
+        # Start from empty space.
+        empty = [" " * len(row) for row in ECHO_LOGO]
+        if not self._render(empty):
+            return
+        if not self._sleep_frame(24):
+            return
+
+        for y in range(self.logo_height - 1, -1, -1):
+            xs = rows[y][:]
+            rng.shuffle(xs)
+
+            while xs:
+                # Tiny fragments: usually 1–2 cells, occasionally 3.
+                size = rng.choices([1, 2, 3], weights=[50, 40, 10])[0]
+                size = min(size, len(xs))
+                piece_xs = xs[:size]
+                del xs[:size]
+
+                # Keep the piece exactly shaped as the selected logo cells.
+                min_x = min(piece_xs)
+                max_x = max(piece_xs)
+
+                # Each selected cell has its own vertical trail.
+                start_y = -4 - rng.randint(0, 2)
+
+                # Fast drop. A few intermediate frames are enough for speed.
+                for step in range(4):
+                    current_y = round(
+                        start_y + (y - start_y) * ((step + 1) / 4.0)
+                    )
+
+                    falling: list[tuple[int, int, str]] = []
+
+                    # Piece head.
+                    for px in piece_xs:
+                        falling.append((px, current_y, "▓"))
+
+                    # Speed trail is ALWAYS ordered from weak -> strong.
+                    # Only one vertical trail per piece-column is shown.
+                    for px in range(min_x, max_x + 1):
+                        if px not in piece_xs:
+                            continue
+                        for offset, trail_char in enumerate(("░", "▒", "▓"), 1):
+                            trail_y = current_y - offset
+                            if 0 <= trail_y < self.logo_height:
+                                falling.append((px, trail_y, trail_char))
+
+                    if not self._render(self._tetris_frame(locked, falling)):
+                        return
+                    if not self._sleep_frame(45):
+                        return
+
+                # Instant lock into the REAL logo.
+                for px in piece_xs:
+                    locked.add((px, y))
+
+                if not self._render(self._tetris_frame(locked)):
+                    return
+                if not self._sleep_frame(120):
+                    return
+
+        # Exact final logo.
+        if not self._render(ECHO_LOGO):
+            return
+        self._sleep_frame(18)
+
+    def _choose_animation(self):
+        animations = [
+            ("rotation", self._rotation),
+            ("particles", self._particles),
+            ("materialize", self._materialize),
+            ("glitch", self._glitch),
+            ("tetris", self._tetris),
+        ]
+        available = [
+            item for item in animations
+            if item[0] != self._last_animation
+        ]
+        name, callback = random.choice(available or animations)
+        self._last_animation = name
+        return callback
+
+    def _run(self):
+        # Start from the stable logo, then continuously select effects.
+        self.set_frame(ECHO_LOGO)
+
+        while not self._stop_event.is_set():
+            animation = self._choose_animation()
+            animation()
+
+            if self._stop_event.wait(random.uniform(0.08, 0.18)):
+                return
+
+    def start(self, app: Application) -> None:
+        if not self.enabled:
+            self.set_frame(ECHO_LOGO)
+            return
+
+        if self._thread and self._thread.is_alive():
+            return
+
+        self._app = app
+        self._stop_event.clear()
+        self._last_animation = None
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="echo-logo-animation",
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+        if self._thread:
+            self._thread.join(timeout=1.0)
+
+        self._thread = None
+        self._app = None
+        self.set_frame(ECHO_LOGO)
+
+
+def print_banner(config: Optional[EchoConfig] = None):
+    """Static banner for non-interactive/non-TTY use."""
+    for line in LogoAnimator(config, enabled=False).current_lines():
+        # Keep ANSI already embedded in the composed banner.
+        print(line)
 
 
 # ============================================================
@@ -1411,6 +2060,11 @@ class StreamingUI:
 # ============================================================
 
 def main():
+    # Clear previous visible content and scrollback once at startup.
+    # Never clear on Ctrl+C or normal REPL exit.
+    sys.stdout.write("\033[3J\033[2J\033[H")
+    sys.stdout.flush()
+
     parser = argparse.ArgumentParser(description="Echo — Local AI Support Assistant with Tool Execution")
     parser.add_argument("prompt", nargs="?", default=None, help="User prompt to execute. If omitted, runs in interactive mode.")
     parser.add_argument("--workspace", "-w", default="./workspace", help="Workspace directory path")
@@ -1490,8 +2144,7 @@ def main():
             sys.exit(130)
 
     # Interactive mode (REPL).
-    print_banner(config)
-    echo_input = EchoInput(config)
+    echo_input = EchoInput(config, animate_logo=(not args.quiet))
     last_stats: Optional[str] = None
 
     try:
@@ -1572,6 +2225,7 @@ def main():
                 print("\nExiting...")
                 break
     finally:
+        echo_input.stop_logo_animation()
         # Restore the cursor to visible + default user shape when
         # leaving the REPL. Without this, the terminal may be left
         # with an invisible cursor or a "blinking block" shape.
@@ -1581,3 +2235,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
