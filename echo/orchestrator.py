@@ -255,6 +255,7 @@ class EchoOrchestrator:
 
             msg: Optional[Dict[str, Any]] = None
             content_buffer = ""
+            live_content_streamed = False
 
             try:
                 for event in self.client.chat_completion_stream(
@@ -264,13 +265,33 @@ class EchoOrchestrator:
                     temperature=self.config.temperature,
                 ):
                     if event["type"] == "content":
-                        # On the first iteration, buffer content instead of
-                        # emitting it live. This avoids flashing the raw
-                        # tool-call JSON on screen before the fallback
-                        # converts it into an actual tool_calls list.
-                        # Ref: Agy (jetski/cli/steps/steps.go buffers the
-                        # model payload before deciding activity vs text).
-                        content_buffer += event["delta"]
+                        delta = event["delta"]
+
+                        # Stream normal text immediately. Only hold content
+                        # that plausibly starts a JSON/fenced tool-call so the
+                        # non-native tool fallback can inspect it safely.
+                        if live_content_streamed:
+                            self._emit(
+                                "content_delta",
+                                {"delta": delta, "iteration": iteration},
+                            )
+                            continue
+
+                        content_buffer += delta
+                        probe = content_buffer.lstrip()
+
+                        hold_for_tool_fallback = (
+                            probe.startswith("{")
+                            or probe.startswith("```json")
+                        )
+
+                        if not hold_for_tool_fallback:
+                            self._emit(
+                                "content_delta",
+                                {"delta": content_buffer, "iteration": iteration},
+                            )
+                            content_buffer = ""
+                            live_content_streamed = True
 
                     elif event["type"] == "tool_call_delta":
                         self._emit(
@@ -306,9 +327,8 @@ class EchoOrchestrator:
                         "Stream ended without a final assistant message"
                     )
 
-                # On the first iteration, if we buffered content and it
-                # was NOT a tool call (structured or JSON fallback), flush
-                # it as a normal response delta so the user sees it.
+                # Flush content that was held because it looked like a
+                # possible fallback tool-call, but only when it is not a tool.
                 if content_buffer:
                     pending_tool_calls = msg.get("tool_calls")
 
@@ -623,7 +643,47 @@ class EchoOrchestrator:
                             }
                         )
 
-                        continue
+                        # A denied mutation must never be followed by another
+                        # model turn that could hallucinate successful execution.
+                        # The user explicitly rejected the operation, so finish
+                        # this turn with a factual local response.
+                        final_content = (
+                            f"A operação '{tool_name}' foi cancelada pelo usuário. "
+                            "Nenhuma alteração foi realizada."
+                        )
+
+                        self._emit(
+                            "content_delta",
+                            {
+                                "delta": final_content,
+                                "iteration": iteration,
+                            },
+                        )
+                        self._emit(
+                            "run_completed",
+                            {
+                                "final_response": final_content,
+                                "iterations": iteration,
+                                "tool_executions": len(all_tool_executions),
+                                "duration": time.perf_counter() - start_time,
+                            },
+                        )
+
+                        total_duration = time.perf_counter() - start_time
+
+                        return OrchestratorResult(
+                            user_prompt=user_prompt,
+                            final_response=final_content,
+                            iterations=iteration,
+                            tool_executions=all_tool_executions,
+                            messages=messages,
+                            total_duration_seconds=total_duration,
+                            model_name=self.config.model,
+                            stopped_reason="user_cancelled",
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            total_tokens=total_tokens,
+                        )
 
                 execution = self.registry.execute(
                     call_id=call_id,
