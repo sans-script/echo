@@ -1,4 +1,9 @@
-use crate::{input::Composer, ui};
+use crate::{
+    history::History,
+    input::Composer,
+    ui,
+    workspace_helpers::{list_workspace, tree_workspace},
+};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
@@ -61,6 +66,7 @@ pub struct Message {
 pub struct EchoApp {
     pub running: bool,
     pub composer: Composer,
+    pub history: History,
     pub messages: Vec<Message>,
     pub overlay: Overlay,
     pub completion: CompletionState,
@@ -76,6 +82,7 @@ impl EchoApp {
         Self {
             running: true,
             composer: Composer::new(),
+            history: History::new(),
             messages: Vec::new(),
             overlay: Overlay::None,
             completion: CompletionState::default(),
@@ -92,6 +99,10 @@ impl EchoApp {
 
     pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
         while self.running {
+            // The TUI redraws frequently enough to drive the software cursor
+            // without exposing or depending on the terminal's native cursor.
+            self.composer.tick_cursor();
+
             terminal
                 .draw(|frame| ui::draw(frame, self))
                 .map_err(io::Error::other)?;
@@ -156,19 +167,37 @@ impl EchoApp {
             }
         }
 
-        match self.overlay {
-            Overlay::Help => match key.code {
-                KeyCode::Esc | KeyCode::Char('?') => {
+        if self.overlay == Overlay::Help {
+            match key.code {
+                KeyCode::Esc => {
                     self.overlay = Overlay::None;
                     self.scroll.follow_end = true;
                 }
+                KeyCode::Char('?') if self.composer.is_empty() => {
+                    self.overlay = Overlay::None;
+                    self.scroll.follow_end = true;
+                }
+                KeyCode::Char('/') if self.composer.is_empty() => {
+                    // Typing '/' while help is visible switches directly to
+                    // command completion, just like Python's completion state
+                    // disables the shortcuts panel.
+                    self.overlay = Overlay::None;
+                    self.handle_composer_key(key);
+                }
                 KeyCode::PageUp => self.scroll_by(-(self.page_size() as isize)),
                 KeyCode::PageDown => self.scroll_by(self.page_size() as isize),
-                _ => {}
-            },
-            Overlay::None => self.handle_composer_key(key),
-            Overlay::ModelPicker => unreachable!(),
+                KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_to_start()
+                }
+                KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_to_end()
+                }
+                _ => self.handle_composer_key(key),
+            }
+            return;
         }
+
+        self.handle_composer_key(key);
     }
 
     fn handle_model_picker_key(&mut self, key: KeyEvent) {
@@ -212,26 +241,55 @@ impl EchoApp {
             }
             KeyCode::Enter => self.submit(),
             KeyCode::Backspace => {
+                self.history.clear_navigation();
                 self.composer.backspace();
                 self.completion.selected = 0;
                 self.completion.visible = self.composer.text().starts_with('/');
             }
             KeyCode::Delete => {
+                self.history.clear_navigation();
                 self.composer.delete();
                 self.completion.selected = 0;
                 self.completion.visible = self.composer.text().starts_with('/');
             }
-            KeyCode::Left => self.composer.move_left(),
-            KeyCode::Right => self.composer.move_right(),
+            KeyCode::Left => {
+                self.history.clear_navigation();
+                self.composer.move_left();
+            }
+            KeyCode::Right => {
+                self.history.clear_navigation();
+                self.composer.move_right();
+            }
             KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.scroll_to_start()
             }
             KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_to_end(),
-            KeyCode::Home => self.composer.home(),
-            KeyCode::End => self.composer.end(),
+            KeyCode::Home => {
+                self.history.clear_navigation();
+                self.composer.home();
+            }
+            KeyCode::End => {
+                self.history.clear_navigation();
+                self.composer.end();
+            }
             KeyCode::PageUp => self.scroll_by(-(self.page_size() as isize)),
             KeyCode::PageDown => self.scroll_by(self.page_size() as isize),
+            KeyCode::Up => {
+                if let Some(text) = self.history.previous(&self.composer.text()) {
+                    self.replace_composer(&text);
+                    self.completion.visible = text.starts_with('/');
+                    self.completion.selected = 0;
+                }
+            }
+            KeyCode::Down => {
+                if let Some(text) = self.history.next() {
+                    self.replace_composer(&text);
+                    self.completion.visible = text.starts_with('/');
+                    self.completion.selected = 0;
+                }
+            }
             KeyCode::Char(ch) => {
+                self.history.clear_navigation();
                 self.composer.insert(ch);
                 self.completion.selected = 0;
                 self.completion.visible = self.composer.text().starts_with('/');
@@ -268,6 +326,13 @@ impl EchoApp {
         }
     }
 
+    fn replace_composer(&mut self, text: &str) {
+        self.composer.clear();
+        for ch in text.chars() {
+            self.composer.insert(ch);
+        }
+    }
+
     fn submit(&mut self) {
         let text = self.composer.text();
 
@@ -275,8 +340,13 @@ impl EchoApp {
             return;
         }
 
+        self.history.push(&text);
+
         if let Some(command) = text.strip_prefix('/') {
-            self.handle_command(command.trim(), text.clone());
+            let mut parts = command.trim().splitn(2, char::is_whitespace);
+            let name = parts.next().unwrap_or("").to_lowercase();
+            let arg = parts.next().unwrap_or("").trim();
+            self.handle_command(&name, arg, text.clone());
         } else {
             self.messages.push(Message {
                 role: MessageRole::User,
@@ -295,7 +365,7 @@ impl EchoApp {
         self.scroll.follow_end = true;
     }
 
-    fn handle_command(&mut self, command: &str, raw: String) {
+    fn handle_command(&mut self, command: &str, arg: &str, raw: String) {
         self.messages.push(Message {
             role: MessageRole::User,
             content: raw,
@@ -317,6 +387,58 @@ impl EchoApp {
                 self.overlay = Overlay::ModelPicker;
                 self.completion.visible = false;
                 self.scroll.follow_end = true;
+            }
+            "stats" => self.messages.push(Message {
+                role: MessageRole::Assistant,
+                content: "No stats yet.".into(),
+            }),
+            "ls" => self.messages.push(Message {
+                role: MessageRole::Assistant,
+                content: list_workspace(&self.workspace),
+            }),
+            "tree" => self.messages.push(Message {
+                role: MessageRole::Assistant,
+                content: tree_workspace(&self.workspace, 2),
+            }),
+            "model" => {
+                if arg.is_empty() {
+                    self.messages.push(Message {
+                        role: MessageRole::Assistant,
+                        content: format!("Usage: /model <name>\nCurrent model: {}", self.model),
+                    });
+                } else {
+                    self.model = arg.to_string();
+                    self.messages.push(Message {
+                        role: MessageRole::Assistant,
+                        content: format!("Model switched to: {}", self.model),
+                    });
+                }
+            }
+            "workspace" => {
+                if arg.is_empty() {
+                    self.messages.push(Message {
+                        role: MessageRole::Assistant,
+                        content: format!("Current workspace: {}", self.workspace.display()),
+                    });
+                } else {
+                    let path = PathBuf::from(arg);
+                    match std::fs::canonicalize(&path) {
+                        Ok(path) if path.is_dir() => {
+                            self.workspace = path;
+                            self.messages.push(Message {
+                                role: MessageRole::Assistant,
+                                content: format!(
+                                    "Workspace changed to: {}",
+                                    self.workspace.display()
+                                ),
+                            });
+                        }
+                        _ => self.messages.push(Message {
+                            role: MessageRole::Assistant,
+                            content: format!("Error: '{}' is not a valid directory.", arg),
+                        }),
+                    }
+                }
             }
             _ => self.messages.push(Message {
                 role: MessageRole::Assistant,
@@ -360,5 +482,59 @@ impl EchoApp {
 
     fn page_size(&self) -> usize {
         self.scroll.viewport_height.max(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EchoApp, Message, MessageRole, Overlay};
+
+    #[test]
+    fn clear_command_removes_existing_history() {
+        let mut app = EchoApp::new();
+        app.messages.push(Message {
+            role: MessageRole::User,
+            content: "hello".into(),
+        });
+        app.messages.push(Message {
+            role: MessageRole::Assistant,
+            content: "response".into(),
+        });
+
+        app.handle_command("clear", "", "/clear".into());
+
+        assert!(app.messages.is_empty());
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.running);
+    }
+
+    #[test]
+    fn exit_command_stops_application() {
+        let mut app = EchoApp::new();
+
+        app.handle_command("exit", "", "/exit".into());
+
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn quit_command_is_exit_alias() {
+        let mut app = EchoApp::new();
+
+        app.handle_command("quit", "", "/quit".into());
+
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn uppercase_command_is_normalized_on_submit() {
+        let mut app = EchoApp::new();
+        for ch in "/EXIT".chars() {
+            app.composer.insert(ch);
+        }
+
+        app.submit();
+
+        assert!(!app.running);
     }
 }

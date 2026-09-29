@@ -1,6 +1,8 @@
 mod app;
+mod history;
 mod input;
 mod ui;
+mod workspace_helpers;
 
 use std::io;
 

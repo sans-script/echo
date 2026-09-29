@@ -39,7 +39,7 @@ pub fn draw(frame: &mut Frame, app: &mut EchoApp) {
 
     let completion_height = if app.completion_active() {
         let count = app.matching_commands().len().min(8);
-        if count > 0 { 1 + count as u16 } else { 0 }
+        if count > 0 { 2 + count as u16 } else { 0 }
     } else {
         0
     };
@@ -257,7 +257,7 @@ fn chat_lines(app: &EchoApp) -> Vec<Line<'static>> {
                 "> ",
                 Style::default().fg(DIM_GRAY).add_modifier(Modifier::BOLD),
             ),
-            MessageRole::Assistant => ("", Style::default().fg(WHITE)),
+            MessageRole::Assistant => ("> ", Style::default().fg(WHITE)),
         };
 
         for (index, line) in message.content.split('\n').enumerate() {
@@ -384,6 +384,9 @@ fn draw_completion(frame: &mut Frame, area: Rect, app: &EchoApp) {
             Span::styled(format!("   {}", description), meta_style),
         ]));
     }
+
+    // Blank row separating the last suggestion from the active "/" input.
+    rows.push(Line::default());
 
     frame.render_widget(Paragraph::new(rows), area);
 }
