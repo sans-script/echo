@@ -1,4 +1,5 @@
 use crate::{
+    config::EchoConfig,
     history::History,
     input::Composer,
     ui,
@@ -79,10 +80,14 @@ pub struct EchoApp {
 
 impl EchoApp {
     pub fn new() -> Self {
+        let config = EchoConfig::load();
+        let workspace = config.workspace;
+        let history = History::load_persistent(&workspace);
+
         Self {
             running: true,
             composer: Composer::new(),
-            history: History::new(),
+            history,
             messages: Vec::new(),
             overlay: Overlay::None,
             completion: CompletionState::default(),
@@ -91,8 +96,8 @@ impl EchoApp {
                 follow_end: true,
                 ..ScrollState::default()
             },
-            model: "qwen2.5:3b-instruct".to_string(),
-            workspace: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            model: config.model,
+            workspace,
             last_activity: Instant::now(),
         }
     }
@@ -396,10 +401,27 @@ impl EchoApp {
                 role: MessageRole::Assistant,
                 content: list_workspace(&self.workspace),
             }),
-            "tree" => self.messages.push(Message {
-                role: MessageRole::Assistant,
-                content: tree_workspace(&self.workspace, 2),
-            }),
+            "tree" => {
+                let depth = if arg.is_empty() {
+                    2
+                } else {
+                    match arg.parse::<usize>() {
+                        Ok(depth) => depth,
+                        Err(_) => {
+                            self.messages.push(Message {
+                                role: MessageRole::Assistant,
+                                content: format!("Usage: /tree [depth]\nInvalid depth: {arg}"),
+                            });
+                            return;
+                        }
+                    }
+                };
+
+                self.messages.push(Message {
+                    role: MessageRole::Assistant,
+                    content: tree_workspace(&self.workspace, depth),
+                });
+            }
             "model" => {
                 if arg.is_empty() {
                     self.messages.push(Message {
@@ -408,6 +430,11 @@ impl EchoApp {
                     });
                 } else {
                     self.model = arg.to_string();
+                    let _ = EchoConfig {
+                        model: self.model.clone(),
+                        workspace: self.workspace.clone(),
+                    }
+                    .save();
                     self.messages.push(Message {
                         role: MessageRole::Assistant,
                         content: format!("Model switched to: {}", self.model),
@@ -425,6 +452,12 @@ impl EchoApp {
                     match std::fs::canonicalize(&path) {
                         Ok(path) if path.is_dir() => {
                             self.workspace = path;
+                            self.history.set_workspace(&self.workspace);
+                            let _ = EchoConfig {
+                                model: self.model.clone(),
+                                workspace: self.workspace.clone(),
+                            }
+                            .save();
                             self.messages.push(Message {
                                 role: MessageRole::Assistant,
                                 content: format!(

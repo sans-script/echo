@@ -1,8 +1,25 @@
+use serde::Deserialize;
+use serde_json::json;
+use std::{
+    env,
+    fs::{self, OpenOptions},
+    io::{self, BufRead, Write},
+    path::PathBuf,
+    time::SystemTime,
+};
+
 #[derive(Debug, Default)]
 pub struct History {
     entries: Vec<String>,
     position: Option<usize>,
     draft: String,
+    file: Option<PathBuf>,
+    workspace: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryEntry {
+    text: String,
 }
 
 impl History {
@@ -10,18 +27,77 @@ impl History {
         Self::default()
     }
 
+    pub fn load_persistent(workspace: &std::path::Path) -> Self {
+        let file = history_path();
+        let workspace = workspace.to_string_lossy().into_owned();
+        let mut history = Self {
+            entries: Vec::new(),
+            position: None,
+            draft: String::new(),
+            file: Some(file.clone()),
+            workspace: Some(workspace),
+        };
+
+        let Ok(file) = fs::File::open(file) else {
+            return history;
+        };
+
+        for line in io::BufReader::new(file).lines().map_while(Result::ok) {
+            if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&line) {
+                if !entry.text.is_empty() {
+                    history.entries.push(entry.text);
+                }
+            }
+        }
+
+        history
+    }
+
+    pub fn set_workspace(&mut self, workspace: &std::path::Path) {
+        self.workspace = Some(workspace.to_string_lossy().into_owned());
+    }
+
     pub fn push(&mut self, text: &str) {
-        let text = text.trim_end_matches('\n');
-        if text.trim().is_empty() {
+        let raw = text.trim_end_matches('\n');
+        let trimmed = raw.trim();
+
+        if trimmed.is_empty()
+            || raw.starts_with(' ')
+            || matches!(
+                trimmed.to_ascii_lowercase().as_str(),
+                "/exit" | "/quit" | "exit" | "quit"
+            )
+        {
+            self.clear_navigation();
             return;
         }
 
-        if self.entries.last().map(String::as_str) != Some(text) {
-            self.entries.push(text.to_string());
+        if self.entries.last().map(String::as_str) == Some(trimmed) {
+            self.clear_navigation();
+            return;
         }
 
-        self.position = None;
-        self.draft.clear();
+        self.entries.push(trimmed.to_string());
+
+        if let Some(file) = &self.file {
+            if let Some(parent) = file.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+
+            let entry = json!({
+                "text": trimmed,
+                "timestamp": timestamp(),
+                "workspace": self.workspace.as_deref().unwrap_or(""),
+            });
+
+            if let Ok(line) = serde_json::to_string(&entry) {
+                if let Ok(mut out) = OpenOptions::new().create(true).append(true).open(file) {
+                    let _ = writeln!(out, "{line}");
+                }
+            }
+        }
+
+        self.clear_navigation();
     }
 
     pub fn previous(&mut self, current: &str) -> Option<String> {
@@ -60,6 +136,19 @@ impl History {
     fn entries(&self) -> &[String] {
         &self.entries
     }
+}
+
+fn history_path() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".echo")
+        .join("history.jsonl")
+}
+
+fn timestamp() -> String {
+    chrono::DateTime::<chrono::Utc>::from(SystemTime::now()).to_rfc3339()
 }
 
 #[cfg(test)]

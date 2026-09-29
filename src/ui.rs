@@ -37,13 +37,6 @@ pub fn draw(frame: &mut Frame, app: &mut EchoApp) {
         return;
     }
 
-    let completion_height = if app.completion_active() {
-        let count = app.matching_commands().len().min(8);
-        if count > 0 { 2 + count as u16 } else { 0 }
-    } else {
-        0
-    };
-
     let composer_height = app
         .composer
         .wrapped_height(area.width)
@@ -55,7 +48,6 @@ pub fn draw(frame: &mut Frame, app: &mut EchoApp) {
             Constraint::Length(8),
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(completion_height),
             Constraint::Length(composer_height),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -66,13 +58,13 @@ pub fn draw(frame: &mut Frame, app: &mut EchoApp) {
     draw_divider(frame, chunks[1]);
     draw_middle(frame, chunks[2], app);
 
-    if completion_height > 0 {
-        draw_completion(frame, chunks[3], app);
+    if app.completion_active() {
+        draw_completion(frame, chunks[2], app);
     }
 
-    draw_composer(frame, chunks[4], app);
-    draw_divider(frame, chunks[5]);
-    draw_footer(frame, chunks[6], app);
+    draw_composer(frame, chunks[3], app);
+    draw_divider(frame, chunks[4]);
+    draw_footer(frame, chunks[5], app);
 }
 
 fn draw_model_picker_layout(frame: &mut Frame, app: &mut EchoApp, area: Rect) {
@@ -339,28 +331,38 @@ fn help_lines() -> Vec<Line<'static>> {
 
 fn draw_completion(frame: &mut Frame, area: Rect, app: &EchoApp) {
     let matches = app.matching_commands();
-    if matches.is_empty() {
+    if matches.is_empty() || area.height == 0 || area.width == 0 {
         return;
     }
 
-    // The completion menu is bottom-docked immediately above the input.
-    // Python limits the visible menu to eight rows and shifts the visible
-    // slice as the selected item moves.
+    // The completion menu is an overlay: it is bottom-docked over the
+    // transcript instead of consuming layout height and pushing messages.
+    // Keep one blank row above and one blank row below the suggestions.
     let max_rows = 8usize;
     let selected = app.completion.selected.min(matches.len() - 1);
     let start = selected.saturating_sub(max_rows - 1);
     let visible = &matches[start..matches.len().min(start + max_rows)];
+    let menu_height = visible.len() as u16 + 2;
 
-    let mut rows = Vec::with_capacity(1 + visible.len());
+    if menu_height > area.height {
+        return;
+    }
 
-    // One blank row separates the transcript from the completion list.
-    rows.push(Line::default());
+    let menu_area = Rect {
+        x: area.x,
+        y: area.y + area.height - menu_height - 1,
+        width: area.width,
+        height: menu_height,
+    };
 
     let name_width = visible
         .iter()
         .map(|(name, _)| name.len())
         .max()
         .unwrap_or(0);
+
+    let mut rows = Vec::with_capacity(menu_height as usize);
+    rows.push(Line::default());
 
     for (offset, (command, description)) in visible.iter().enumerate() {
         let index = start + offset;
@@ -385,10 +387,9 @@ fn draw_completion(frame: &mut Frame, area: Rect, app: &EchoApp) {
         ]));
     }
 
-    // Blank row separating the last suggestion from the active "/" input.
     rows.push(Line::default());
 
-    frame.render_widget(Paragraph::new(rows), area);
+    frame.render_widget(Paragraph::new(rows).wrap(Wrap { trim: false }), menu_area);
 }
 
 fn draw_model_list(frame: &mut Frame, area: Rect, app: &EchoApp) {

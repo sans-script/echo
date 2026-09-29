@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod history;
 mod input;
 mod ui;
