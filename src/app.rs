@@ -2,6 +2,7 @@ use crate::{
     config::EchoConfig,
     history::History,
     input::Composer,
+    tools::registry::ToolRegistry,
     ui,
     workspace_helpers::{list_workspace, tree_workspace},
 };
@@ -63,7 +64,6 @@ pub struct Message {
     pub content: String,
 }
 
-#[derive(Debug)]
 pub struct EchoApp {
     pub running: bool,
     pub composer: Composer,
@@ -75,6 +75,8 @@ pub struct EchoApp {
     pub scroll: ScrollState,
     pub model: String,
     pub workspace: PathBuf,
+    #[allow(dead_code)]
+    pub tools: ToolRegistry,
     last_activity: Instant,
 }
 
@@ -83,6 +85,8 @@ impl EchoApp {
         let config = EchoConfig::load();
         let workspace = config.workspace;
         let history = History::load_persistent(&workspace);
+        let mut tools = ToolRegistry::default();
+        let _ = crate::tools::filesystem::register_filesystem_tools(&mut tools, &workspace);
 
         Self {
             running: true,
@@ -98,6 +102,7 @@ impl EchoApp {
             },
             model: config.model,
             workspace,
+            tools,
             last_activity: Instant::now(),
         }
     }

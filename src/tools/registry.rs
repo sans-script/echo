@@ -1,7 +1,8 @@
 use serde_json::{Map, Value};
+use std::sync::Arc;
 use std::{collections::BTreeMap, time::Instant};
 
-pub type ToolHandler = fn(&Map<String, Value>) -> Result<String, String>;
+pub type ToolHandler = Arc<dyn Fn(&Map<String, Value>) -> Result<String, String> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct ToolDefinition {
@@ -41,6 +42,7 @@ impl ToolDefinition {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ToolExecutionRecord {
     pub call_id: String,
@@ -198,7 +200,7 @@ impl ToolRegistry {
         let parsed = self.validate_and_parse_args(tool_name, raw_arguments);
         let (arguments, result, success, error) = match parsed {
             Ok(arguments) => {
-                let handler = self.get(tool_name).map(|tool| tool.handler);
+                let handler = self.get(tool_name).map(|tool| Arc::clone(&tool.handler));
                 match handler {
                     Some(handler) => match handler(&arguments) {
                         Ok(mut result) => {
@@ -341,7 +343,10 @@ mod tests {
         Err("boom".into())
     }
 
-    fn definition(confirm: bool, handler: ToolHandler) -> ToolDefinition {
+    fn definition(
+        confirm: bool,
+        handler: fn(&Map<String, Value>) -> Result<String, String>,
+    ) -> ToolDefinition {
         ToolDefinition::new(
             "echo",
             "Echo a value.",
@@ -356,7 +361,7 @@ mod tests {
                 "additionalProperties": false
             }),
             confirm,
-            handler,
+            Arc::new(handler),
         )
     }
 
