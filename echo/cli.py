@@ -11,7 +11,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
@@ -23,6 +23,7 @@ from prompt_toolkit.layout import Window
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.cursor_shapes import CursorShape
 from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.layout.screen import Char
 from prompt_toolkit.history import History
 from prompt_toolkit import prompt
 from prompt_toolkit.key_binding import KeyBindings
@@ -224,7 +225,14 @@ class LiveTranscript:
                 lines.append("")
             lines.append(f"{GRAY}{status}{RESET}")
         else:
-            lines = text.rstrip("\n").split("\n") if text else []
+            # Preserve exactly one empty row after the latest chat content.
+            # Trailing newlines are normalized so the gap never accumulates,
+            # but it remains visible when another bottom panel (/? /models /
+            # confirmation) is opened and the viewport is reflowed.
+            base = text.rstrip("\n")
+            lines = base.split("\n") if base else []
+            if lines:
+                lines.append("")
 
         if self.max_lines > 0:
             lines = lines[-self.max_lines:]
@@ -277,27 +285,82 @@ class TranscriptScrollablePane(ScrollablePane):
         self._virtual_height = virtual_height
         self._viewport_height = write_position.height
         max_scroll = max(0, virtual_height - write_position.height)
+        self._scroll_range = max_scroll
 
         if self._follow_end:
             self.vertical_scroll = max_scroll
         else:
             self.vertical_scroll = max(
-                0, min(self.vertical_scroll, max_scroll)
+                0, min(self.vertical_scroll, self._scroll_range)
             )
 
-        super().write_to_screen(
-            screen,
-            mouse_handlers,
-            write_position,
-            parent_style,
-            erase_bg,
-            z_index,
+        # The scrollable pane never owns the input cursor. Force the
+        # off-screen render to keep cursor visibility disabled; otherwise
+        # ScrollablePane can propagate the focused input cursor into this
+        # viewport as a duplicate block cursor.
+        original_show_cursor = screen.show_cursor
+        screen.show_cursor = False
+        try:
+            super().write_to_screen(
+                screen,
+                mouse_handlers,
+                write_position,
+                parent_style,
+                erase_bg,
+                z_index,
+            )
+        finally:
+            screen.show_cursor = original_show_cursor
+
+    def _draw_scrollbar(self, write_position, content_height, screen) -> None:
+        """Draw a scrollbar whose thumb maps exactly to the scroll range."""
+        viewport_height = write_position.height
+        track_height = viewport_height
+
+        if content_height <= viewport_height:
+            return
+
+        scroll_range = content_height - viewport_height
+
+        # Thumb size is proportional to the visible fraction of the content.
+        thumb_height = max(
+            1,
+            min(
+                track_height,
+                int(round(track_height * viewport_height / content_height)),
+            ),
         )
+
+        # The thumb itself can only travel through the part of the track
+        # remaining after its own height.
+        max_thumb_top = max(0, track_height - thumb_height)
+
+        # Clamp content scroll independently, then map it to the thumb range.
+        scroll = max(0, min(self.vertical_scroll, scroll_range))
+        if scroll_range:
+            thumb_top = int(
+                round(max_thumb_top * (scroll / float(scroll_range)))
+            )
+        else:
+            thumb_top = 0
+
+        xpos = write_position.xpos + write_position.width - 1
+        ypos = write_position.ypos
+        data_buffer = screen.data_buffer
+
+        for row in range(track_height):
+            if thumb_top <= row < thumb_top + thumb_height:
+                style = "class:scrollbar.button"
+            else:
+                style = "class:scrollbar.background"
+            data_buffer[ypos + row][xpos] = Char(" ", style)
 
     def scroll_by(self, delta: int) -> None:
         """Scroll by visual rows and stop following the live tail."""
-        max_scroll = max(
-            0, self._virtual_height - self._viewport_height
+        max_scroll = getattr(
+            self,
+            "_scroll_range",
+            max(0, self._virtual_height - self._viewport_height),
         )
         if max_scroll == 0:
             self._follow_end = True
@@ -315,8 +378,10 @@ class TranscriptScrollablePane(ScrollablePane):
 
     def scroll_to_end(self) -> None:
         self._follow_end = True
-        self.vertical_scroll = max(
-            0, self._virtual_height - self._viewport_height
+        self.vertical_scroll = getattr(
+            self,
+            "_scroll_range",
+            max(0, self._virtual_height - self._viewport_height),
         )
 
 
@@ -605,6 +670,10 @@ PROMPT_STYLE = Style.from_dict(
         "scrollbar.background": "bg:#303030 #303030",
         "scrollbar.button": "bg:#909090 #909090",
         "scrollbar.arrow": "#707070",
+
+        "picker.item": "#d4d4d4",
+        "picker.selected": "#ffffff bold",
+        "picker.hint": "#808080",
     }
 )
 
@@ -621,33 +690,33 @@ def create_key_bindings(echo_input: "EchoInput") -> KeyBindings:
     @bindings.add(Keys.ScrollUp, eager=True, is_global=True)
     def handle_scroll_up(event):
         # Mouse wheel: move only a few visual rows at a time.
-        echo_input.transcript_scroll.scroll_by(-2)
+        echo_input.middle_scroll.scroll_by(-2)
         event.app.invalidate()
 
     @bindings.add(Keys.ScrollDown, eager=True, is_global=True)
     def handle_scroll_down(event):
-        echo_input.transcript_scroll.scroll_by(2)
+        echo_input.middle_scroll.scroll_by(2)
         event.app.invalidate()
 
     @bindings.add(Keys.PageUp, eager=True, is_global=True)
     def handle_page_up(event):
-        echo_input.transcript_scroll.scroll_by(-4)
+        echo_input.middle_scroll.scroll_by(-4)
         event.app.invalidate()
 
     @bindings.add(Keys.PageDown, eager=True, is_global=True)
     def handle_page_down(event):
-        echo_input.transcript_scroll.scroll_by(4)
+        echo_input.middle_scroll.scroll_by(4)
         event.app.invalidate()
 
     @bindings.add(Keys.ControlHome, eager=True)
     def handle_transcript_home(event):
-        echo_input.transcript_scroll._follow_end = False
-        echo_input.transcript_scroll.vertical_scroll = 0
+        echo_input.middle_scroll._follow_end = False
+        echo_input.middle_scroll.vertical_scroll = 0
         event.app.invalidate()
 
     @bindings.add(Keys.ControlEnd, eager=True)
     def handle_transcript_end(event):
-        echo_input.transcript_scroll.scroll_to_end()
+        echo_input.middle_scroll.scroll_to_end()
         event.app.invalidate()
 
     @bindings.add("y", filter=Condition(lambda: echo_input.confirmation_active), eager=True)
@@ -674,6 +743,43 @@ def create_key_bindings(echo_input: "EchoInput") -> KeyBindings:
     @bindings.add("escape", filter=Condition(lambda: echo_input.confirmation_active), eager=True)
     def handle_confirm_escape(event):
         echo_input.resolve_confirmation(False)
+
+    @bindings.add("up", filter=Condition(lambda: echo_input.model_picker_active), eager=True)
+    @bindings.add("k", filter=Condition(lambda: echo_input.model_picker_active), eager=True)
+    def handle_model_picker_up(event):
+        if echo_input._model_picker_models:
+            echo_input._model_picker_index = (
+                echo_input._model_picker_index - 1
+            ) % len(echo_input._model_picker_models)
+            event.app.invalidate()
+
+    @bindings.add("down", filter=Condition(lambda: echo_input.model_picker_active), eager=True)
+    @bindings.add("j", filter=Condition(lambda: echo_input.model_picker_active), eager=True)
+    def handle_model_picker_down(event):
+        if echo_input._model_picker_models:
+            echo_input._model_picker_index = (
+                echo_input._model_picker_index + 1
+            ) % len(echo_input._model_picker_models)
+            event.app.invalidate()
+
+    @bindings.add("enter", filter=Condition(lambda: echo_input.model_picker_active), eager=True)
+    def handle_model_picker_enter(event):
+        models = echo_input._model_picker_models
+        if models:
+            echo_input._model_picker_result = models[
+                echo_input._model_picker_index
+            ]["name"]
+        else:
+            echo_input._model_picker_result = None
+        echo_input._model_picker_event.set()
+        event.app.invalidate()
+
+    @bindings.add("escape", filter=Condition(lambda: echo_input.model_picker_active), eager=True)
+    @bindings.add("c-c", filter=Condition(lambda: echo_input.model_picker_active), eager=True)
+    def handle_model_picker_cancel(event):
+        echo_input._model_picker_result = None
+        echo_input._model_picker_event.set()
+        event.app.invalidate()
 
     @bindings.add("enter")
     def handle_enter(event):
@@ -764,10 +870,27 @@ def create_key_bindings(echo_input: "EchoInput") -> KeyBindings:
 
         echo_input.submit_text(event, expanded_text.strip())
 
-    @bindings.add("?", filter=Condition(lambda: not echo_input.buffer.text), eager=True)
+    @bindings.add(
+        "?",
+        filter=Condition(
+            lambda: (
+                not echo_input.buffer.text
+                and not echo_input.model_picker_active
+                and not echo_input.buffer.complete_state
+            )
+        ),
+        eager=True,
+    )
     def handle_shortcuts(event):
-        """Toggle the shortcuts panel without touching conversation history."""
+        """Toggle shortcuts; never show it together with the model picker."""
         echo_input.show_shortcuts = not echo_input.show_shortcuts
+        if echo_input.show_shortcuts:
+            # The help panel is the first content in the combined viewport.
+            echo_input.middle_scroll._follow_end = False
+            echo_input.middle_scroll.vertical_scroll = 0
+        else:
+            # Closing help returns the conversation to its newest content.
+            echo_input.middle_scroll.scroll_to_end()
         event.app.invalidate()
 
     @bindings.add("c-j")
@@ -1071,6 +1194,16 @@ class EchoInput:
         self._confirmation_message = ""
         self._confirmation_choice = True
 
+        # Integrated model picker. It uses the same prompt_toolkit
+        # application as the normal prompt, so /models never opens a second
+        # renderer or corrupts the persistent footer/banner.
+        self._model_picker_event = threading.Event()
+        self._model_picker_result: Optional[str] = None
+        self._model_picker_active = False
+        self._model_picker_models: list[dict] = []
+        self._model_picker_index = 0
+        self._model_picker_current = ""
+
         # ── Persistent history ────────────────────────────────────────────
         # JSONL format (not FileHistory) for richer metadata.
         # Ref: Agy ~/.gemini/antigravity-cli/history.jsonl (NDJSON schema).
@@ -1122,10 +1255,6 @@ class EchoInput:
             dont_extend_height=False,
         )
 
-        self.transcript_scroll = TranscriptScrollablePane(
-            self.transcript_window,
-            height=Dimension(min=0, weight=1),
-        )
 
         # Line 1: Top separator.
         self.top_separator = Window(
@@ -1193,8 +1322,21 @@ class EchoInput:
         # This prevents the fake cursor from appearing attached to the last
         # response line or to the execution statistics.
         self.prompt_gap = ConditionalContainer(
-            Window(height=1),
-            filter=Condition(lambda: not self.confirmation_active),
+            Window(
+                FormattedTextControl(
+                    lambda: [(
+                        "class:picker.hint",
+                        "Up/Down to move, Enter to select, Esc to cancel",
+                    )]
+                ),
+                height=1,
+                dont_extend_height=True,
+            ),
+            filter=Condition(lambda: self.model_picker_active),
+            alternative_content=Window(
+                height=1,
+                dont_extend_height=True,
+            ),
         )
 
         # Tool confirmation is a temporary bottom-docked panel. The details
@@ -1213,7 +1355,21 @@ class EchoInput:
 
         self.normal_input_container = ConditionalContainer(
             self.input_line,
-            filter=Condition(lambda: not self.confirmation_active),
+            filter=Condition(
+                lambda: (
+                    not self.confirmation_active
+                    and not self.model_picker_active
+                )
+            ),
+        )
+
+        self.model_picker_window = ConditionalContainer(
+            Window(
+                FormattedTextControl(self._model_picker_fragments),
+                height=Dimension(min=1, max=14),
+                dont_extend_height=True,
+            ),
+            filter=Condition(lambda: self.model_picker_active),
         )
 
         # Toggleable shortcuts panel. It is separate from the transcript, so
@@ -1221,10 +1377,45 @@ class EchoInput:
         self.shortcuts_window = ConditionalContainer(
             Window(
                 FormattedTextControl(lambda: ANSI(_show_help())),
+                height=len(_show_help().splitlines()),
                 wrap_lines=False,
                 dont_extend_height=True,
             ),
             filter=Condition(lambda: self.show_shortcuts),
+        )
+
+        # Shared scrollable middle viewport. It contains the optional '?'
+        # panel and the conversation, so a large help panel cannot overlap the
+        # chat or any bottom-docked controls.
+        self.slash_completion_panel = ConditionalContainer(
+            HSplit([
+                Window(height=1, dont_extend_height=True),
+                Window(
+                    FormattedTextControl(self._completion_fragments),
+                    dont_extend_height=True,
+                ),
+            ]),
+            filter=has_completions,
+        )
+
+        self.middle_content = HSplit([
+            self.shortcuts_window,
+            ConditionalContainer(
+                Window(height=1),
+                filter=Condition(lambda: self.show_shortcuts),
+            ),
+            self.transcript_window,
+            self.slash_completion_panel,
+        ])
+        self.middle_scroll = TranscriptScrollablePane(
+            self.middle_content,
+            height=Dimension(min=0, weight=1),
+        )
+
+        # One empty row between the model list and its keyboard hint.
+        self.model_picker_hint_gap = ConditionalContainer(
+            Window(height=1, dont_extend_height=True),
+            filter=Condition(lambda: self.model_picker_active),
         )
 
         # Line 3: Bottom separator.
@@ -1246,29 +1437,12 @@ class EchoInput:
             self.logo_window,
             self.top_separator,
 
-            # '?' is a top-level help panel: it belongs immediately below
-            # the banner and above the conversation/history area.
-            self.shortcuts_window,
-
-            # Visual separation between the shortcuts panel and conversation.
-            Window(height=1),
-
-            self.transcript_scroll,
-
-            # '/' autocomplete is a prompt-only panel: it belongs immediately
-            # above the bottom prompt and never shares the help panel's space.
-            ConditionalContainer(
-                HSplit([
-                    Window(
-                        FormattedTextControl(self._completion_fragments),
-                        dont_extend_height=True,
-                    ),
-                    Window(height=1),
-                ]),
-                filter=has_completions,
-            ),
+            # Shared scrollable middle: '?' help + conversation history.
+            self.middle_scroll,
 
             self.confirmation_details_window,
+            self.model_picker_window,
+            self.model_picker_hint_gap,
             self.prompt_gap,
             ConditionalContainer(
                 self.confirmation_input_line,
@@ -1314,7 +1488,10 @@ class EchoInput:
             key_bindings=create_key_bindings(self),
             style=PROMPT_STYLE,
             cursor=CursorShape._NEVER_CHANGE,
-            full_screen=False,
+            # Full-screen mode is required to truly anchor the transcript and
+            # prompt/footer to the terminal viewport. The conversation occupies
+            # the flexible middle; the input and footer stay at the bottom.
+            full_screen=True,
             erase_when_done=False,
             # Keep terminal-native mouse selection/copy. The scrollbar remains
             # visible and keyboard scrolling remains available, but the
@@ -1329,16 +1506,34 @@ class EchoInput:
         self.app.renderer.cpr_support = CPR_Support.NOT_SUPPORTED
         self.transcript.set_invalidator(self.app.invalidate)
 
+        # Keep / suggestions docked to the end of the shared middle viewport.
+        # The panel is still part of the scrollable content, so when ? and /
+        # together exceed the available height the viewport scrolls instead
+        # of allowing either panel to overlap the other.
+        self.buffer.on_completions_changed += (
+            lambda _buffer: self._sync_completion_scroll()
+        )
+
         self.layout.focus(self.buffer)
 
-        # Start the logo animation immediately. The prompt_toolkit application
-        # renders the prompt and animated banner together, so there is no
-        # startup animation delay before the prompt becomes usable.
-        self.start_logo_animation()
+        # Start the logo animation from Application.pre_run so the first
+        # rendered frame is produced only after the complete layout exists.
+        # This prevents the initial footer/transcript viewport from appearing
+        # stale until a later UI event such as toggling "?".
 
     def _logo_fragments(self):
         # FormattedTextControl accepts ANSI-formatted text directly.
         return ANSI("\n".join(self.logo_animator.current_lines()))
+
+    def _sync_completion_scroll(self) -> None:
+        # Slash completion and the shortcuts panel are mutually exclusive.
+        # As soon as '/' suggestions become active, close '?' so the two
+        # panels never occupy the same viewport.
+        if self.buffer.complete_state:
+            self.show_shortcuts = False
+            self.middle_scroll.scroll_to_end()
+        elif not self.show_shortcuts:
+            self.middle_scroll.scroll_to_end()
 
     def start_logo_animation(self):
         self.logo_animator.start(self.app)
@@ -1389,7 +1584,11 @@ class EchoInput:
         Reference: Codex (custom_terminal.rs autoresize) & Agy (layout/layout.go).
         Prevents separator wrapping and line corruption on resize.
         """
-        return max(get_terminal_width() - 1, 20)
+        # Use the complete terminal width. The layout is full-screen, so
+        # subtracting one column here creates a permanent blank strip on the
+        # right side. The conversation scrollbar reserves its own column
+        # independently when it is actually visible.
+        return max(get_terminal_width(), 20)
 
     def get_footer_text(self):
         left_text = "? for shortcuts"
@@ -1406,6 +1605,75 @@ class EchoInput:
     @property
     def confirmation_active(self) -> bool:
         return self._confirmation_active
+
+    @property
+    def model_picker_active(self) -> bool:
+        return self._model_picker_active
+
+    def _model_picker_fragments(self):
+        models = self._model_picker_models
+        if not models:
+            return ANSI("No models installed.")
+
+        fragments = []
+        for i, model in enumerate(models[:12]):
+            selected = i == self._model_picker_index
+            current = (
+                _normalize_model_name(model["name"])
+                == _normalize_model_name(self._model_picker_current)
+            )
+            marker = "> " if selected else "  "
+            suffix = "  (current)" if current else ""
+            style = (
+                "class:picker.selected"
+                if selected
+                else "class:picker.item"
+            )
+            fragments.append(
+                (style, f"{marker}{model['name']}{suffix}")
+            )
+            if i < min(len(models), 12) - 1:
+                fragments.append(("", "\n"))
+
+        return fragments
+
+    def request_model_picker(
+        self,
+        models: list[dict],
+        current: str,
+    ) -> Optional[str]:
+        """Open the model picker inside the persistent Echo application."""
+        # The shortcuts/help panel and model picker are mutually exclusive.
+        self.show_shortcuts = False
+        self._model_picker_models = list(models)
+        self._model_picker_current = current
+        self._model_picker_result = None
+        self._model_picker_event.clear()
+        self._model_picker_index = 0
+
+        current_norm = _normalize_model_name(current)
+        for i, model in enumerate(self._model_picker_models):
+            if _normalize_model_name(model["name"]) == current_norm:
+                self._model_picker_index = i
+                break
+
+        self._model_picker_active = True
+        self.confirmation_buffer.reset()
+        self.app.layout.focus(self.confirmation_buffer)
+        self._cursor_blink.mark_typing()
+        self.app.invalidate()
+
+        self._model_picker_event.wait()
+        result = self._model_picker_result
+
+        self._model_picker_active = False
+        self._model_picker_models = []
+        self._model_picker_result = None
+        self.app.layout.focus(self.buffer)
+        self._cursor_blink.mark_typing()
+        self.app.invalidate()
+
+        return result
 
     def request_confirmation(self, message: str) -> bool:
         """Show confirmation details above the input and wait for its answer."""
@@ -1491,9 +1759,13 @@ class EchoInput:
 
     def run(self) -> None:
         """Run one persistent prompt application for the entire REPL session."""
+        def pre_run() -> None:
+            self.start_logo_animation()
+            self.app.invalidate()
+
         self._cursor_blink.start(self.app)
         try:
-            self.app.run()
+            self.app.run(pre_run=pre_run)
         finally:
             self._cursor_blink.stop()
             sys.stdout.write(CURSOR_HIDE)
@@ -1635,6 +1907,8 @@ def execute_slash_command(
     cmd_result: str,
     config: EchoConfig,
     last_stats: Optional[str],
+    model_picker=None,
+    output: Optional[Callable[[str], None]] = None,
 ) -> tuple[bool, bool, bool]:
     """
     Execute a slash command from the REPL loop.
@@ -1648,8 +1922,14 @@ def execute_slash_command(
     # Strip the internal \x00 prefix marker.
     payload = cmd_result.lstrip("\x00")
 
+    # Interactive slash-command output must go through the persistent
+    # transcript renderer instead of stdout. Direct print() calls while a
+    # full-screen prompt_toolkit Application is active can leave a duplicate
+    # software cursor and corrupt the layout.
+    emit = output or (lambda text: print(text, end=""))
+
     if payload == "/help":
-        print("\n" + _show_help())
+        emit("\n" + _show_help() + "\n")
         return True, False, False
 
     elif payload == "/clear":
@@ -1661,62 +1941,49 @@ def execute_slash_command(
 
     elif payload == "/stats":
         if last_stats:
-            print(f"\n{GRAY}[{last_stats}]{RESET}")
+            emit(f"\n{GRAY}[{last_stats}]{RESET}\n")
         else:
-            print(f"\n{GRAY}No stats yet.{RESET}")
+            emit(f"\n{GRAY}No stats yet.{RESET}\n")
         return True, False, False
 
     elif payload == "/tree":
           from echo.tools.filesystem import FilesystemToolHandler
           handler = FilesystemToolHandler(config.workspace_root)
-          print(f"\n{handler.tree('.')}")
+          emit(f"\n{handler.tree('.')}\n")
           return True, False, False
 
     elif payload == "/ls":
           from echo.tools.filesystem import FilesystemToolHandler
           handler = FilesystemToolHandler(config.workspace_root)
-          print(f"\n{handler.list_directory('.')}")
+          emit(f"\n{handler.list_directory('.')}\n")
           return True, False, False
 
     elif payload == "/models":
-        loading = Spinner("Loading models")
-        loading_started = time.perf_counter()
-        print()
-        loading.start()
         try:
             models = fetch_installed_models(config.ollama_url)
-            # Mantem o spinner visivel tempo suficiente para ser percebido.
-            remaining = 0.4 - (time.perf_counter() - loading_started)
-            if remaining > 0:
-                time.sleep(remaining)
         except (OSError, ValueError) as exc:
-            loading.stop()
-            sys.stdout.write("\033[1A")
-            sys.stdout.flush()
-            print(f"\n{RED}Could not list models from {config.ollama_url}: {exc}{RESET}")
+            emit(f"\n{RED}Could not list models from {config.ollama_url}: {exc}{RESET}\n")
             return True, False, False
-        finally:
-            loading.stop()
-        sys.stdout.write("\033[1A")
-        sys.stdout.flush()
 
         if not models:
-            print(f"\n{YELLOW}No models installed. Run: ollama pull <name>{RESET}")
+            emit(f"\n{YELLOW}No models installed. Run: ollama pull <name>{RESET}\n")
             return True, False, False
 
-        chosen = select_model_interactive(models, config.model)
+        if model_picker is not None:
+            chosen = model_picker(models, config.model)
+        else:
+            chosen = select_model_interactive(models, config.model)
+
         if chosen and _normalize_model_name(chosen) != _normalize_model_name(config.model):
             config.model = chosen  # type: ignore[attr-defined]
             save_settings(config)
-            print(f"\n{GREEN}Model switched to: {chosen}{RESET}")
             return True, True, False
 
-        print(f"\n{GRAY}Model unchanged: {config.model}{RESET}")
         return True, False, False
 
     elif payload == "/model?":
-        print(f"\n{YELLOW}Usage: /model <name>{RESET}")
-        print(f"{GRAY}Current model: {config.model}{RESET}")
+        emit(f"\n{YELLOW}Usage: /model <name>{RESET}\n")
+        emit(f"{GRAY}Current model: {config.model}{RESET}\n")
         return True, False, False
 
     elif payload.startswith("/model "):
@@ -1724,13 +1991,13 @@ def execute_slash_command(
         if new_model:
             config.model = new_model  # type: ignore[attr-defined]
             save_settings(config)
-            print(f"\n{GREEN}Model switched to: {new_model}{RESET}")
+            emit(f"\n{GREEN}Model switched to: {new_model}{RESET}\n")
             return True, True, False
         return True, False, False
 
     elif payload == "/workspace?":
-        print(f"\n{YELLOW}Usage: /workspace <path>{RESET}")
-        print(f"{GRAY}Current workspace: {config.workspace_root}{RESET}")
+        emit(f"\n{YELLOW}Usage: /workspace <path>{RESET}\n")
+        emit(f"{GRAY}Current workspace: {config.workspace_root}{RESET}\n")
         return True, False, False
 
     elif payload.startswith("/workspace "):
@@ -1739,18 +2006,18 @@ def execute_slash_command(
         if new_path.exists() and new_path.is_dir():
             config.workspace_root = new_path  # type: ignore[attr-defined]
             save_settings(config)
-            print(f"\n{GREEN}Workspace changed to: {new_path}{RESET}")
+            emit(f"\n{GREEN}Workspace changed to: {new_path}{RESET}\n")
             return True, False, True
         else:
-            print(f"\n{RED}Error: '{new_ws}' is not a valid directory.{RESET}")
+            emit(f"\n{RED}Error: '{new_ws}' is not a valid directory.{RESET}\n")
             return True, False, False
 
     elif payload.startswith("/unknown "):
         unknown_cmd = payload[len("/unknown "):].strip()
         # Extract just the command part.
         cmd_name = unknown_cmd.split()[0] if unknown_cmd else unknown_cmd
-        print(f"\n{RED}Unknown command: {cmd_name}{RESET}")
-        print(f"{GRAY}Type /help to see available commands.{RESET}")
+        emit(f"\n{RED}Unknown command: {cmd_name}{RESET}\n")
+        emit(f"{GRAY}Type /help to see available commands.{RESET}\n")
         return True, False, False
 
     return True, False, False
@@ -2665,7 +2932,7 @@ def main():
             return False
 
         # A new turn always starts at the newest part of the conversation.
-        echo_input.transcript_scroll.scroll_to_end()
+        echo_input.middle_scroll.scroll_to_end()
 
         shown = echo_input.last_display or user_input
         echo_lines = shown.splitlines() or [shown]
@@ -2686,7 +2953,11 @@ def main():
                 ui._append("Goodbye!\n")
                 return True
             should_continue, _model_changed, workspace_changed = execute_slash_command(
-                user_input, config, last_stats
+                user_input,
+                config,
+                last_stats,
+                model_picker=echo_input.request_model_picker,
+                output=ui._append,
             )
             if not should_continue:
                 ui._append("Goodbye!\n")

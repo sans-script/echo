@@ -1,8 +1,11 @@
 """Echo Orchestrator and Tool-Calling Loop."""
 
 import json
+import os
+import platform
 import time
 import uuid
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -158,6 +161,26 @@ class EchoOrchestrator:
             trimmed = trimmed[user_idx[-max_turns]:]
         return trimmed
 
+    def _environment_context(self) -> str:
+        """Build the dynamic execution context injected into each turn."""
+        now = datetime.now().astimezone()
+        timezone_name = now.tzname() or "unknown"
+        shell = (
+            os.environ.get("SHELL")
+            or os.environ.get("COMSPEC")
+            or "unknown"
+        )
+        return (
+            "\n\n<environment>\n"
+            f"Current date/time: {now.isoformat(timespec='seconds')}\n"
+            f"Timezone: {timezone_name}\n"
+            f"Operating system: {platform.system()} {platform.release()}\n"
+            f"Shell: {shell}\n"
+            f"Working directory: {self.config.workspace_root}\n"
+            f"Model: {self.config.model}\n"
+            "</environment>"
+        )
+
     def _workspace_context(self) -> str:
         """Snapshot of the workspace, appended to the system prompt each turn."""
         try:
@@ -202,7 +225,21 @@ class EchoOrchestrator:
             system_prompt
             or self.config.system_prompt
         )
-        sys_prompt = sys_prompt + self._workspace_context()
+        sys_prompt = (
+            sys_prompt
+            + self._environment_context()
+            + self._workspace_context()
+            + """
+<response_rules>
+Use environment information internally.
+Do not copy raw environment values into normal user-facing answers.
+For date/time questions, convert the ISO timestamp to natural human-readable
+language. Do not include the raw timestamp unless the user asks for it.
+For environment questions, answer conversationally instead of reproducing
+the environment fields.
+</response_rules>
+"""
+        )
 
         messages: List[Dict[str, Any]] = (
             [{"role": "system", "content": sys_prompt}]
