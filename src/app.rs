@@ -377,7 +377,15 @@ impl EchoApp {
         });
 
         match command {
-            "new" | "clear" => {
+            "new" | "reset" => {
+                self.messages.clear();
+                self.overlay = Overlay::None;
+                self.messages.push(Message {
+                    role: MessageRole::Assistant,
+                    content: "Conversation cleared.".into(),
+                });
+            }
+            "clear" => {
                 self.messages.clear();
                 self.overlay = Overlay::None;
             }
@@ -473,10 +481,14 @@ impl EchoApp {
                     }
                 }
             }
-            _ => self.messages.push(Message {
-                role: MessageRole::Assistant,
-                content: format!("Unknown command: /{command}"),
-            }),
+            _ => {
+                self.messages.push(Message {
+                    role: MessageRole::Assistant,
+                    content: format!(
+                        "Unknown command: /{command}\nType /help to see available commands."
+                    ),
+                });
+            }
         }
     }
 
@@ -539,6 +551,44 @@ mod tests {
         assert!(app.messages.is_empty());
         assert_eq!(app.overlay, Overlay::None);
         assert!(app.running);
+    }
+
+    #[test]
+    fn new_command_clears_conversation_and_reports_it() {
+        let mut app = EchoApp::new();
+        app.messages.push(Message {
+            role: MessageRole::User,
+            content: "old".into(),
+        });
+
+        app.handle_command("new", "", "/new".into());
+
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].content, "Conversation cleared.");
+        assert_eq!(app.messages[0].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn reset_command_is_new_alias() {
+        let mut app = EchoApp::new();
+        app.messages.push(Message {
+            role: MessageRole::User,
+            content: "old".into(),
+        });
+
+        app.handle_command("reset", "", "/reset".into());
+
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].content, "Conversation cleared.");
+    }
+
+    #[test]
+    fn unknown_command_points_to_help() {
+        let mut app = EchoApp::new();
+
+        app.handle_command("does-not-exist", "", "/does-not-exist".into());
+
+        assert!(app.messages.last().unwrap().content.contains("Type /help"));
     }
 
     #[test]
