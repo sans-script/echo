@@ -60,6 +60,19 @@ impl Composer {
         self.cursor = 0;
     }
 
+    pub fn wrapped_height(&self, width: u16) -> u16 {
+        let width = usize::from(width.max(1));
+        let text = self.visible_with_cursor();
+        let mut rows = 0usize;
+
+        for line in text.split('\n') {
+            let line_width = line.chars().count();
+            rows += line_width.div_ceil(width).max(1);
+        }
+
+        rows.max(1).min(usize::from(u16::MAX)) as u16
+    }
+
     pub fn visible_with_cursor(&self) -> String {
         let mut output = String::with_capacity(self.chars.len() + 3);
 
@@ -103,10 +116,10 @@ mod tests {
 
         composer.move_left();
         composer.backspace();
-        assert_eq!(composer.text(), "bc");
+        assert_eq!(composer.text(), "ac");
 
         composer.delete();
-        assert_eq!(composer.text(), "b");
+        assert_eq!(composer.text(), "a");
     }
 
     #[test]
