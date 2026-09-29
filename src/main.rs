@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod history;
 mod input;
+mod tools;
 mod ui;
 mod workspace_helpers;
 
