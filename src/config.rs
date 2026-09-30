@@ -11,17 +11,29 @@ struct SavedConfig {
 
 #[derive(Debug, Clone)]
 pub struct EchoConfig {
+    pub ollama_url: String,
     pub model: String,
     pub workspace: PathBuf,
+    pub max_iterations: usize,
+    pub temperature: f64,
+    pub request_timeout: f64,
+    pub max_tool_output_chars: usize,
+    pub system_prompt: String,
 }
 
 impl Default for EchoConfig {
     fn default() -> Self {
         Self {
+            ollama_url: "http://localhost:11434".to_string(),
             model: "qwen2.5-coder".to_string(),
             workspace: env::current_dir()
                 .map(|p| p.join("workspace"))
                 .unwrap_or_else(|_| PathBuf::from("./workspace")),
+            max_iterations: 10,
+            temperature: 0.0,
+            request_timeout: 60.0,
+            max_tool_output_chars: 8000,
+            system_prompt: "You are Echo, a local AI support assistant running inside a terminal. Be practical, concise, technically capable, and honest.".to_string(),
         }
     }
 }
@@ -51,7 +63,16 @@ impl EchoConfig {
             .filter(|p| p.is_dir())
             .unwrap_or(defaults.workspace);
 
-        Self { model, workspace }
+        Self {
+            ollama_url: defaults.ollama_url,
+            model,
+            workspace,
+            max_iterations: defaults.max_iterations,
+            temperature: defaults.temperature,
+            request_timeout: defaults.request_timeout,
+            max_tool_output_chars: defaults.max_tool_output_chars,
+            system_prompt: defaults.system_prompt,
+        }
     }
 
     pub fn save(&self) -> io::Result<()> {

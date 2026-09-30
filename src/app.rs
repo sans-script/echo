@@ -2,8 +2,9 @@ use crate::{
     config::EchoConfig,
     history::History,
     input::Composer,
-    tools::registry::ToolRegistry,
+    orchestrator::EchoOrchestrator,
     ui,
+    tools::registry::ToolRegistry,
     workspace_helpers::{list_workspace, tree_workspace},
 };
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
@@ -75,18 +76,19 @@ pub struct EchoApp {
     pub scroll: ScrollState,
     pub model: String,
     pub workspace: PathBuf,
-    #[allow(dead_code)]
-    pub tools: ToolRegistry,
+    pub orchestrator: EchoOrchestrator,
     last_activity: Instant,
 }
 
 impl EchoApp {
     pub fn new() -> Self {
         let config = EchoConfig::load();
-        let workspace = config.workspace;
+        let workspace = config.workspace.clone();
         let history = History::load_persistent(&workspace);
         let mut tools = ToolRegistry::default();
         let _ = crate::tools::filesystem::register_filesystem_tools(&mut tools, &workspace);
+        let orchestrator = EchoOrchestrator::new(config.clone(), tools)
+            .expect("failed to initialize Ollama client");
 
         Self {
             running: true,
@@ -102,7 +104,7 @@ impl EchoApp {
             },
             model: config.model,
             workspace,
-            tools,
+            orchestrator,
             last_activity: Instant::now(),
         }
     }
@@ -362,9 +364,13 @@ impl EchoApp {
                 role: MessageRole::User,
                 content: text,
             });
+            let result = self.orchestrator.run(text.clone(), None, |_| {});
+            let content = result.error_message
+                .map(|error| format!("Error: {error}"))
+                .unwrap_or(result.final_response);
             self.messages.push(Message {
                 role: MessageRole::Assistant,
-                content: "Echo base is running. The inference backend is not connected yet.".into(),
+                content,
             });
         }
 
@@ -383,6 +389,7 @@ impl EchoApp {
 
         match command {
             "new" | "reset" => {
+                self.orchestrator.reset_history();
                 self.messages.clear();
                 self.overlay = Overlay::None;
                 self.messages.push(Message {
@@ -391,6 +398,7 @@ impl EchoApp {
                 });
             }
             "clear" => {
+                self.orchestrator.reset_history();
                 self.messages.clear();
                 self.overlay = Overlay::None;
             }
@@ -443,11 +451,8 @@ impl EchoApp {
                     });
                 } else {
                     self.model = arg.to_string();
-                    let _ = EchoConfig {
-                        model: self.model.clone(),
-                        workspace: self.workspace.clone(),
-                    }
-                    .save();
+                    self.orchestrator.config.model = self.model.clone();
+                    let _ = self.orchestrator.config.clone().save();
                     self.messages.push(Message {
                         role: MessageRole::Assistant,
                         content: format!("Model switched to: {}", self.model),
@@ -466,11 +471,23 @@ impl EchoApp {
                         Ok(path) if path.is_dir() => {
                             self.workspace = path;
                             self.history.set_workspace(&self.workspace);
-                            let _ = EchoConfig {
-                                model: self.model.clone(),
-                                workspace: self.workspace.clone(),
+                            let mut config = self.orchestrator.config.clone();
+                            config.workspace = self.workspace.clone();
+                            let mut tools = ToolRegistry::default();
+                            let _ = crate::tools::filesystem::register_filesystem_tools(
+                                &mut tools, &self.workspace
+                            );
+                            match EchoOrchestrator::new(config, tools) {
+                                Ok(orchestrator) => self.orchestrator = orchestrator,
+                                Err(error) => {
+                                    self.messages.push(Message {
+                                        role: MessageRole::Assistant,
+                                        content: format!("Error initializing Ollama: {error}"),
+                                    });
+                                    return;
+                                }
                             }
-                            .save();
+                            let _ = self.orchestrator.config.clone().save();
                             self.messages.push(Message {
                                 role: MessageRole::Assistant,
                                 content: format!(

@@ -2,6 +2,8 @@ mod app;
 mod config;
 mod history;
 mod input;
+mod ollama;
+mod orchestrator;
 mod tools;
 mod ui;
 mod workspace_helpers;
