@@ -1,4 +1,5 @@
 use crate::{
+    clipboard,
     config::EchoConfig,
     history::History,
     input::Composer,
@@ -15,7 +16,8 @@ use crate::{
     workspace_helpers::display_path,
 };
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use serde_json::Value;
@@ -127,6 +129,19 @@ pub struct Confirmation {
     reply: Sender<bool>,
 }
 
+/// Text selected with the mouse, in screen cells (column, row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: (u16, u16),
+    pub head: (u16, u16),
+    pub dragging: bool,
+    /// Set when the drag ends; the next frame copies the selected text.
+    pub copy: bool,
+}
+
+/// How long footer notices such as "Copied N characters" stay visible.
+pub const NOTICE_TIME: Duration = Duration::from_secs(2);
+
 /// Ctrl+R reverse history search.
 pub struct HistorySearch {
     pub query: String,
@@ -173,6 +188,9 @@ pub struct EchoApp {
     pub waiting_since: Option<Instant>,
     /// Show tool calls, tool results and stats in the transcript.
     pub verbose: bool,
+    pub selection: Option<Selection>,
+    /// Short message shown in the footer for `NOTICE_TIME`.
+    pub notice: Option<(String, Instant)>,
     last_stats: Option<String>,
     pastes: Vec<(String, String)>,
     run: Option<PendingRun>,
@@ -218,6 +236,8 @@ impl EchoApp {
             search: None,
             waiting_since: None,
             verbose,
+            selection: None,
+            notice: None,
             last_stats: None,
             pastes: Vec::new(),
             run: None,
@@ -236,9 +256,25 @@ impl EchoApp {
             // without exposing or depending on the terminal's native cursor.
             self.composer.tick_cursor();
 
+            let mut copied = None;
             terminal
-                .draw(|frame| ui::draw(frame, self))
+                .draw(|frame| {
+                    ui::draw(frame, self);
+                    if let Some(selection) = &mut self.selection {
+                        ui::highlight_selection(frame.buffer_mut(), selection);
+                        if std::mem::take(&mut selection.copy) {
+                            copied = Some(ui::selected_text(frame.buffer_mut(), selection));
+                        }
+                    }
+                })
                 .map_err(io::Error::other)?;
+            if let Some(text) = copied.filter(|text| !text.trim().is_empty()) {
+                clipboard::copy(terminal.backend_mut(), &text);
+                self.notice = Some((
+                    format!("Copied {} characters", text.chars().count()),
+                    Instant::now(),
+                ));
+            }
 
             if event::poll(FRAME_TIME)? {
                 // Drain everything already queued: on Windows a paste arrives
@@ -268,10 +304,49 @@ impl EchoApp {
         match event {
             Event::Key(key) => self.handle_key(key),
             Event::Paste(text) => self.handle_paste(text),
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => self.scroll_by(-3),
-                MouseEventKind::ScrollDown => self.scroll_by(3),
-                _ => {}
+            Event::Mouse(mouse) => self.handle_mouse(mouse),
+            _ => {}
+        }
+    }
+
+    /// The wheel scrolls the conversation. Since capturing the mouse turns
+    /// off the terminal's own selection, Echo selects text itself: drag with
+    /// the left button, and the text is copied when the button is released.
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let at = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.selection = None;
+                self.scroll_by(-3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.selection = None;
+                self.scroll_by(3);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.selection = Some(Selection {
+                    anchor: at,
+                    head: at,
+                    dragging: true,
+                    copy: false,
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(selection) = self.selection.as_mut().filter(|s| s.dragging) {
+                    selection.head = at;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => match self.selection.as_mut() {
+                // A plain click clears the selection.
+                Some(selection) if selection.anchor == at && selection.head == at => {
+                    self.selection = None;
+                }
+                Some(selection) => {
+                    selection.head = at;
+                    selection.dragging = false;
+                    selection.copy = true;
+                }
+                None => {}
             },
             _ => {}
         }
@@ -282,6 +357,7 @@ impl EchoApp {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        self.selection = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         if self.confirmation.is_some() {
@@ -708,6 +784,14 @@ impl EchoApp {
             // the model receives the full pasted text.
             let prompt = expand_pastes(trimmed, &self.pastes);
             self.push(MessageRole::User, trimmed.to_string());
+            let budget = self
+                .orchestrator
+                .as_ref()
+                .map_or(4000, |o| o.config.max_tool_output_chars);
+            let (prompt, attached) = attach_files(&prompt, &self.workspace, budget);
+            if !attached.is_empty() {
+                self.push(MessageRole::Muted, format!("Attached: {}", attached.join(", ")));
+            }
             self.start_run(prompt);
         }
 
@@ -759,7 +843,14 @@ impl EchoApp {
                         let output = FilesystemSandbox::new(&self.workspace)
                             .and_then(|sandbox| sandbox.tree(&path, depth as i64, false, true));
                         match output {
-                            Ok(tree) => self.push(MessageRole::Plain, tree),
+                            Ok(tree) => {
+                                if let Some(orchestrator) = self.orchestrator.as_mut() {
+                                    orchestrator.add_context(&format!(
+                                        "The user ran /{command} and Echo showed them:\n{tree}"
+                                    ));
+                                }
+                                self.push(MessageRole::Plain, tree);
+                            }
                             Err(error) => self.push(MessageRole::Error, format!("Error: {error}")),
                         }
                     }
@@ -1201,6 +1292,37 @@ fn parse_tree_args(arg: &str, default_depth: usize) -> Result<(String, usize), S
     Ok((path.unwrap_or_else(|| ".".into()), depth))
 }
 
+/// Appends the content of every `@path` in the prompt that names a file in
+/// the workspace (read with line numbers, like read_file). Returns the new
+/// prompt and the attached paths. Unknown `@words` are left alone.
+pub fn attach_files(prompt: &str, workspace: &Path, budget: usize) -> (String, Vec<String>) {
+    let Ok(sandbox) = FilesystemSandbox::new(workspace) else {
+        return (prompt.to_string(), Vec::new());
+    };
+    let mut attached: Vec<String> = Vec::new();
+    let mut text = prompt.to_string();
+    for word in prompt.split_whitespace() {
+        let Some(name) = word.strip_prefix('@').filter(|name| !name.is_empty()) else {
+            continue;
+        };
+        // "@Main.java," or "(@a.txt)" still attach the file.
+        let trimmed = name.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '"', '\'']);
+        for candidate in [name, trimmed] {
+            if attached.iter().any(|path| path == candidate)
+                || !workspace.join(candidate).is_file()
+            {
+                continue;
+            }
+            if let Ok(content) = sandbox.read_file(candidate, 1, budget) {
+                text.push_str(&format!("\n\n[Attached file: {candidate}]\n{content}"));
+                attached.push(candidate.to_string());
+                break;
+            }
+        }
+    }
+    (text, attached)
+}
+
 fn expand_pastes(text: &str, pastes: &[(String, String)]) -> String {
     pastes
         .iter()
@@ -1608,6 +1730,28 @@ mod tests {
     }
 
     #[test]
+    fn mouse_drag_selects_and_requests_a_copy() {
+        let mut app = EchoApp::new();
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 10));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 8, 11));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 9, 11));
+        let selection = app.selection.unwrap();
+        assert_eq!((selection.anchor, selection.head), ((2, 10), (9, 11)));
+        assert!(selection.copy && !selection.dragging);
+
+        // A click without dragging, the wheel or a key press clears it.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 3));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3, 3));
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
     fn tree_arguments() {
         assert_eq!(parse_tree_args("", 2), Ok((".".into(), 2)));
         assert_eq!(parse_tree_args("--depth=3", 2), Ok((".".into(), 3)));
@@ -1639,6 +1783,26 @@ mod tests {
         app.handle_command("tree", "--depth=3", "/tree --depth=3".into());
         let tree = app.messages.last().unwrap().content.clone();
         assert!(tree.contains("deep/") && tree.contains("x.rs"), "{tree}");
+
+        // The model gets to see what the user saw.
+        let history = &app.orchestrator.as_ref().unwrap().history;
+        let note = history.last().unwrap()["content"].as_str().unwrap();
+        assert!(note.starts_with("[Echo] The user ran /tree") && note.contains("x.rs"), "{note}");
+    }
+
+    #[test]
+    fn at_mentions_attach_workspace_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Main.java"), "class Main {}\n").unwrap();
+
+        let (prompt, attached) = attach_files(
+            "Explain @Main.java, and ping user@example.com about @missing.txt",
+            dir.path(),
+            4000,
+        );
+        assert_eq!(attached, vec!["Main.java".to_string()]);
+        assert!(prompt.ends_with("[Attached file: Main.java]\n1 | class Main {}\n"), "{prompt}");
+        assert!(!prompt.contains("[Attached file: missing.txt]"));
     }
 
     #[test]

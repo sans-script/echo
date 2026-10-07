@@ -1,5 +1,6 @@
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -7,7 +8,10 @@ use ratatui::{
 };
 
 use crate::{
-    app::{CONFIRM_QUESTION, ConfirmTone, EchoApp, MessageRole, Overlay, confirmation_segments},
+    app::{
+        CONFIRM_QUESTION, ConfirmTone, EchoApp, MessageRole, NOTICE_TIME, Overlay, Selection,
+        confirmation_segments,
+    },
     logo::LogoTone,
     markdown,
     logo_frames::{ECHO_LOGO, LOGO_HEIGHT},
@@ -497,6 +501,9 @@ fn help_lines() -> Vec<Line<'static>> {
         ("↑ / ↓", "Navigate history"),
         ("Ctrl+R", "Reverse history search"),
         ("/", "Type to see command autocomplete"),
+        ("@file", "Attach a workspace file to the prompt"),
+        ("Wheel", "Scroll the conversation (also PgUp/PgDn)"),
+        ("Drag", "Select text; it is copied on release"),
     ] {
         lines.push(Line::from(vec![
             Span::raw("  "),
@@ -614,8 +621,75 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &EchoApp) {
     );
 }
 
+/// Selected cells in reading order: from the earlier of the two ends to the
+/// later one, wrapping across rows like terminal selection.
+fn selection_cells(area: Rect, selection: &Selection) -> impl Iterator<Item = (u16, u16)> {
+    let (anchor, head) = (selection.anchor, selection.head);
+    let (start, end) = if (anchor.1, anchor.0) <= (head.1, head.0) {
+        (anchor, head)
+    } else {
+        (head, anchor)
+    };
+    let last_row = end.1.min(area.bottom().saturating_sub(1));
+    (start.1..=last_row).flat_map(move |y| {
+        let from = if y == start.1 { start.0 } else { area.left() };
+        let to = if y == end.1 { end.0 } else { area.right().saturating_sub(1) };
+        (from..=to.min(area.right().saturating_sub(1))).map(move |x| (x, y))
+    })
+}
+
+pub fn highlight_selection(buffer: &mut Buffer, selection: &Selection) {
+    let area = buffer.area;
+    for (x, y) in selection_cells(area, selection) {
+        let cell = &mut buffer[(x, y)];
+        cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+    }
+}
+
+/// The selected text, one line per row, without the padding at the end of
+/// each row. Code copied from a highlighted block loses its line numbers.
+pub fn selected_text(buffer: &Buffer, selection: &Selection) -> String {
+    let mut rows: Vec<String> = Vec::new();
+    let mut current_row = None;
+    for (x, y) in selection_cells(buffer.area, selection) {
+        if current_row != Some(y) {
+            rows.push(String::new());
+            current_row = Some(y);
+        }
+        if let Some(row) = rows.last_mut() {
+            row.push_str(buffer[(x, y)].symbol());
+        }
+    }
+    let rows = rows.iter().map(|row| row.trim_end()).collect::<Vec<_>>();
+    strip_code_gutter(&rows).unwrap_or_else(|| rows.join("\n"))
+}
+
+/// Removes "  12 │ " gutters when every non-empty row has one.
+fn strip_code_gutter(rows: &[&str]) -> Option<String> {
+    let mut found = false;
+    let stripped = rows
+        .iter()
+        .map(|row| {
+            if row.trim().is_empty() {
+                return Some(String::new());
+            }
+            let trimmed = row.trim_start();
+            let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
+            let rest = trimmed[digits..].strip_prefix(" │").filter(|_| digits > 0)?;
+            found = true;
+            Some(rest.strip_prefix(' ').unwrap_or(rest).to_string())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    found.then(|| stripped.join("\n"))
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, app: &EchoApp) {
-    let left = "? for shortcuts";
+    let notice = app
+        .notice
+        .as_ref()
+        .filter(|(_, since)| since.elapsed() < NOTICE_TIME)
+        .map(|(text, _)| text.as_str());
+    let left = notice.unwrap_or("? for shortcuts");
     let right = &app.model;
     let padding = (area.width as usize)
         .saturating_sub(left.len() + right.chars().count())
@@ -740,6 +814,41 @@ mod tests {
             rows[first - 3..first - 1].iter().any(|row| row.contains("chat line")),
             "chat continues above the menu"
         );
+    }
+
+    #[test]
+    fn selection_extracts_text_across_rows() {
+        use super::{highlight_selection, selected_text};
+        use crate::app::Selection;
+        use ratatui::{buffer::Buffer, layout::Rect, style::Modifier};
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 3));
+        buffer.set_string(0, 0, "> first line", ratatui::style::Style::default());
+        buffer.set_string(0, 1, "  second", ratatui::style::Style::default());
+        buffer.set_string(0, 2, "  third", ratatui::style::Style::default());
+        // Dragged backwards, from "thi" up to "first".
+        let selection = Selection { anchor: (4, 2), head: (2, 0), dragging: false, copy: true };
+
+        assert_eq!(selected_text(&buffer, &selection), "first line\n  second\n  thi");
+        highlight_selection(&mut buffer, &selection);
+        assert!(buffer[(2, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(!buffer[(1, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(!buffer[(5, 2)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn copied_code_loses_its_line_numbers() {
+        use super::selected_text;
+        use crate::app::Selection;
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 3));
+        buffer.set_string(0, 0, "   9 │ fn main() {", ratatui::style::Style::default());
+        buffer.set_string(0, 1, "  10 │     run();", ratatui::style::Style::default());
+        buffer.set_string(0, 2, "  11 │ }", ratatui::style::Style::default());
+        let selection = Selection { anchor: (0, 0), head: (29, 2), dragging: false, copy: true };
+
+        assert_eq!(selected_text(&buffer, &selection), "fn main() {\n    run();\n}");
     }
 
     #[test]

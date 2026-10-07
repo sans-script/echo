@@ -3,8 +3,8 @@
 
 use crate::{
     app::{
-        CONFIRM_QUESTION, ConfirmTone, confirmation_details, confirmation_segments,
-        pretty_arguments, tool_result_message,
+        CONFIRM_QUESTION, ConfirmTone, attach_files, confirmation_details,
+        confirmation_segments, pretty_arguments, tool_result_message,
     },
     config::EchoConfig,
     orchestrator::{EchoOrchestrator, OrchestratorEvent, RunStopReason, format_stats},
@@ -55,6 +55,11 @@ pub fn run(config: EchoConfig, prompt: &str, verbose: bool) -> ExitCode {
     let spinner = RefCell::new(Spinner::default());
     let mut printing = false;
     let mut streamed = false;
+    let (prompt, attached) =
+        attach_files(prompt, &workspace, orchestrator.config.max_tool_output_chars);
+    if verbose && !attached.is_empty() {
+        println!("{}\n", paint.gray(&format!("Attached: {}", attached.join(", "))));
+    }
     let result = orchestrator.run(
         prompt,
         None,

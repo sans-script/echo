@@ -24,6 +24,8 @@ const LISTING_NOTE: &str = "\n[Note: this listing is already displayed to the us
 const DECLINED_RESULT: &str = "The user declined this change in the confirmation prompt. The tool was not executed and nothing was modified. This is not an error: briefly confirm to the user that the change was cancelled as they chose, in the same language as their request.";
 const REPEAT_NOTICE: &str = "\n[Notice: You have already executed this tool with the same arguments. Please synthesize your final response.]";
 const WORKSPACE_SNAPSHOT_LINES: usize = 60;
+/// Longest /ls or /tree output added to the conversation for the model.
+const CONTEXT_NOTE_CHARS: usize = 2000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStopReason { Completed, Error, UserCancelled, MaxIterations }
@@ -92,6 +94,17 @@ impl EchoOrchestrator {
     pub fn reset_history(&mut self) {
         self.history.clear();
         self.session_prompt = None;
+    }
+
+    /// Adds output the user saw from Echo's own commands (/ls, /tree) to the
+    /// conversation, so follow-ups like "explain this code" have context.
+    pub fn add_context(&mut self, note: &str) {
+        let cut = floor_char_boundary(note, CONTEXT_NOTE_CHARS);
+        let mut text = format!("[Echo] {}", &note[..cut]);
+        if cut < note.len() {
+            text.push_str("\n... [cut]");
+        }
+        self.history.push(json!({"role": "user", "content": text}));
     }
 
     fn chat_options(&self) -> ChatOptions {

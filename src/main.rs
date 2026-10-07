@@ -1,4 +1,5 @@
 mod app;
+mod clipboard;
 mod config;
 mod highlight;
 mod history;
@@ -18,7 +19,7 @@ use std::{io, path::PathBuf, process::ExitCode, time::Duration};
 
 use crossterm::{
     cursor::MoveTo,
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{
         self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
@@ -175,10 +176,9 @@ fn run_interactive(config: EchoConfig, verbose: bool) -> io::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // The mouse is deliberately not captured, so the terminal's own text
-    // selection and copy keep working (as in the Python version). The
-    // transcript scrolls with PageUp/PageDown and Ctrl+Home/Ctrl+End.
-    execute!(stdout, EnterAlternateScreen)?;
+    // The mouse is captured so the wheel scrolls the conversation; Echo does
+    // its own text selection and copies it to the clipboard.
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     // Not available on every Windows console; pastes then arrive as key
     // bursts, which the app detects on its own.
     let _ = execute!(stdout, EnableBracketedPaste);
@@ -191,7 +191,7 @@ fn run_interactive(config: EchoConfig, verbose: bool) -> io::Result<()> {
 
     disable_raw_mode()?;
     let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
 
     // Leave only the banner, a divider and "Exiting..." on screen.
