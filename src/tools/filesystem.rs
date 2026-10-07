@@ -91,6 +91,47 @@ impl FilesystemSandbox {
         }
         Ok((q.clone(), self.rel(&q)))
     }
+    /// Deletes one file. Directories are refused so a single call can never
+    /// remove a whole tree.
+    pub fn delete_file(&self, path: &str) -> Result<String, String> {
+        let (p, r) = self.resolve_path(path)?;
+        if !p.exists() {
+            return Err(format!("File '{r}' does not exist.{}", self.hint(&p)));
+        }
+        if p.is_dir() {
+            return Err(format!("'{r}' is a directory. Only files can be deleted."));
+        }
+        let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        fs::remove_file(&p).map_err(|e| format!("Could not delete '{r}': {e}"))?;
+        Ok(format!("Deleted '{r}' ({size} bytes)."))
+    }
+    /// Moves or renames a file or directory. Never overwrites.
+    pub fn move_file(&self, source: &str, destination: &str) -> Result<String, String> {
+        let (from, from_rel) = self.resolve_path(source)?;
+        let (to, to_rel) = self.resolve_path(destination)?;
+        if !from.exists() {
+            return Err(format!("'{from_rel}' does not exist.{}", self.hint(&from)));
+        }
+        if to.exists() {
+            return Err(format!("'{to_rel}' already exists. Choose another destination."));
+        }
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        fs::rename(&from, &to).map_err(|e| format!("Could not move '{from_rel}': {e}"))?;
+        Ok(format!("Moved '{from_rel}' to '{to_rel}'."))
+    }
+    pub fn create_directory(&self, path: &str) -> Result<String, String> {
+        let (p, r) = self.resolve_path(path)?;
+        if p.is_dir() {
+            return Ok(format!("Directory '{r}' already exists."));
+        }
+        if p.exists() {
+            return Err(format!("'{r}' exists and is a file."));
+        }
+        fs::create_dir_all(&p).map_err(|e| format!("Could not create '{r}': {e}"))?;
+        Ok(format!("Created directory '{r}'."))
+    }
     fn hint(&self, p: &Path) -> String {
         let n = p
             .file_name()
@@ -121,12 +162,23 @@ impl FilesystemSandbox {
         }
         fs::write(&p, content).map_err(|e| format!("Could not write '{r}': {e}"))?;
         Ok(format!(
-            "Successfully wrote {} bytes to '{r}'. Location: {}",
+            "Successfully wrote {} bytes ({} lines) to '{r}'. Location: {}",
             content.len(),
-            p.display()
+            content.lines().count(),
+            crate::workspace_helpers::display_path(p.clone()).display()
         ))
     }
-    pub fn read_file(&self, path: &str, max: usize) -> Result<String, String> {
+    /// Reads up to `max_chars` characters starting at line `offset` (1-based).
+    /// Every line is prefixed with its number (`  12 | `) so the model knows
+    /// where things are. When the file doesn't fit, the output ends with the
+    /// offset to continue from, so the model can page through large files
+    /// instead of receiving a blindly truncated blob.
+    pub fn read_file(
+        &self,
+        path: &str,
+        offset: usize,
+        max_chars: usize,
+    ) -> Result<String, String> {
         let (p, r) = self.resolve_path(path)?;
         if !p.exists() {
             return Err(format!("File '{r}' does not exist.{}", self.hint(&p)));
@@ -137,12 +189,47 @@ impl FilesystemSandbox {
             ));
         }
         let b = fs::read(&p).map_err(|e| e.to_string())?;
-        let size = b.len();
-        let mut s = String::from_utf8_lossy(&b[..size.min(max)]).into_owned();
-        if size > max {
-            s += &format!("\n... [File truncated: showing first {max} of {size} bytes]")
+        let text = String::from_utf8_lossy(&b);
+        let lines = text.split_inclusive('\n').collect::<Vec<_>>();
+        let total = lines.len();
+        if total == 0 {
+            return Ok(format!("'{r}' is empty."));
         }
-        Ok(s)
+        let first = offset.max(1);
+        if first > total {
+            return Err(format!("offset {first} is past the end of '{r}' ({total} lines)."));
+        }
+        let width = total.to_string().len();
+        let mut out = String::new();
+        let mut last = first - 1;
+        for (index, line) in lines.iter().enumerate().skip(first - 1) {
+            let prefix = number_line(index + 1, width);
+            if out.len() + prefix.len() + line.len() > max_chars {
+                if out.is_empty() {
+                    // A single line longer than the budget (e.g. minified file).
+                    let budget = max_chars.saturating_sub(prefix.len());
+                    let cut = crate::orchestrator::floor_char_boundary(line, budget);
+                    out.push_str(&prefix);
+                    out.push_str(&line[..cut]);
+                    last += 1;
+                }
+                break;
+            }
+            out.push_str(&prefix);
+            out.push_str(line);
+            last += 1;
+        }
+        if first > 1 || last < total {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out += &format!("... [Showing lines {first}-{last} of {total}");
+            if last < total {
+                out += &format!(". Call read_file with offset={} to read more", last + 1);
+            }
+            out.push(']');
+        }
+        Ok(out)
     }
     pub fn list_directory(&self, path: &str) -> Result<String, String> {
         let (p, r) = self.resolve_path(path)?;
@@ -197,6 +284,14 @@ impl FilesystemSandbox {
         }
         let text = String::from_utf8(fs::read(&p).map_err(|e| e.to_string())?)
             .map_err(|_| format!("'{r}' is not a UTF-8 text file."))?;
+        // Models sometimes copy the "N | " prefixes from read_file output.
+        let (old, new) = match strip_line_numbers(old) {
+            Some(stripped) if !text.contains(old) && text.contains(&stripped) => {
+                (stripped, strip_line_numbers(new).unwrap_or_else(|| new.to_string()))
+            }
+            _ => (old.to_string(), new.to_string()),
+        };
+        let (old, new) = (old.as_str(), new.as_str());
         let n = text.matches(old).count();
         if n == 0 {
             return Err(format!(
@@ -208,12 +303,15 @@ impl FilesystemSandbox {
                 "old_text appears {n} times in '{r}'. Include more surrounding lines so it matches exactly once."
             ));
         }
+        let start = line_of(&text, text.find(old).unwrap_or(0));
         fs::write(&p, text.replacen(old, new, 1)).map_err(|e| e.to_string())?;
         Ok(format!(
-            "Edited '{r}': replaced 1 occurrence ({} -> {} chars). Location: {}",
+            "Edited '{r}': replaced lines {start}-{} with {} line(s) ({} -> {} chars). Location: {}",
+            start + line_count(old) - 1,
+            line_count(new),
             old.len(),
             new.len(),
-            p.display()
+            crate::workspace_helpers::display_path(p.clone()).display()
         ))
     }
     pub fn tree(
@@ -488,17 +586,47 @@ fn wild(p: &str, t: &str) -> bool {
     }
     d[p.len()][t.len()]
 }
+/// Line-number prefix used in read_file output: `  12 | `.
+fn number_line(number: usize, width: usize) -> String {
+    format!("{number:>width$} | ")
+}
+
+/// Removes read_file's `N | ` prefixes when every line of `text` has one.
+pub fn strip_line_numbers(text: &str) -> Option<String> {
+    text.split('\n')
+        .map(|line| {
+            let line = line.trim_start();
+            let digits = line.chars().take_while(char::is_ascii_digit).count();
+            let rest = line[digits..].strip_prefix(" |").filter(|_| digits > 0)?;
+            Some(rest.strip_prefix(' ').unwrap_or(rest))
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|lines| lines.join("\n"))
+}
+
+/// 1-based line number of byte offset `at` in `text`.
+pub fn line_of(text: &str, at: usize) -> usize {
+    text[..at].matches('\n').count() + 1
+}
+
+/// Number of lines `text` spans (a trailing newline doesn't start a new one).
+fn line_count(text: &str) -> usize {
+    text.trim_end_matches('\n').matches('\n').count() + 1
+}
+
 pub fn register_filesystem_tools(
     reg: &mut ToolRegistry,
     root: impl AsRef<Path>,
 ) -> Result<Arc<FilesystemSandbox>, String> {
     let fs = Arc::new(FilesystemSandbox::new(root)?);
     let x = Arc::clone(&fs);
-    reg.register(ToolDefinition::new("read_file","Read a text file within the workspace.",json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}),false,Arc::new(move|a: &serde_json::Map<String, Value>|x.read_file(a["path"].as_str().unwrap_or(""),65536))))?;
+    // Leave room for the paging note so the registry's own truncation never cuts it.
+    let read_budget = reg.max_output_chars.saturating_sub(200).max(200);
+    reg.register(ToolDefinition::new("read_file","Read a text file within the workspace. Each line starts with its line number (\"12 | \"), which is not part of the file. Large files are returned in pages; only pass offset (1-based line) when asked to continue reading.",json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"}},"required":["path"],"additionalProperties":false}),false,Arc::new(move|a: &serde_json::Map<String, Value>|x.read_file(a["path"].as_str().unwrap_or(""),a.get("offset").and_then(Value::as_u64).unwrap_or(1) as usize,read_budget))))?;
     let x = Arc::clone(&fs);
     reg.register(ToolDefinition::new("write_file","Write text to a file within the workspace.",json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}),true,Arc::new(move|a: &serde_json::Map<String, Value>|x.write_file(a["path"].as_str().unwrap_or(""),a["content"].as_str().unwrap_or("")))))?;
     let x = Arc::clone(&fs);
-    reg.register(ToolDefinition::new("edit_file","Replace exactly one occurrence in a UTF-8 text file.",json!({"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}),true,Arc::new(move|a: &serde_json::Map<String, Value>|x.edit_file(a["path"].as_str().unwrap_or(""),a["old_text"].as_str().unwrap_or(""),a["new_text"].as_str().unwrap_or("")))))?;
+    reg.register(ToolDefinition::new("edit_file","Replace exactly one occurrence of old_text in a UTF-8 text file. old_text must be the exact file text, without the line-number prefixes shown by read_file.",json!({"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}),true,Arc::new(move|a: &serde_json::Map<String, Value>|x.edit_file(a["path"].as_str().unwrap_or(""),a["old_text"].as_str().unwrap_or(""),a["new_text"].as_str().unwrap_or("")))))?;
     let x = Arc::clone(&fs);
     reg.register(ToolDefinition::new("list_directory","List files and directories.",json!({"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":false}),false,Arc::new(move|a: &serde_json::Map<String, Value>|x.list_directory(a.get("path").and_then(Value::as_str).unwrap_or(".")))))?;
     let x = Arc::clone(&fs);
@@ -507,6 +635,12 @@ pub fn register_filesystem_tools(
     reg.register(ToolDefinition::new("search_files","Search text inside workspace files.",json!({"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"max_results":{"type":"integer"},"ignore_case":{"type":"boolean"}},"required":["query"],"additionalProperties":false}),false,Arc::new(move|a: &serde_json::Map<String, Value>|x.search_files(a["query"].as_str().unwrap_or(""),a.get("path").and_then(Value::as_str).unwrap_or("."),a.get("glob").and_then(Value::as_str).unwrap_or("*"),a.get("max_results").and_then(Value::as_i64).unwrap_or(30),a.get("ignore_case").and_then(Value::as_bool).unwrap_or(true)))))?;
     let x = Arc::clone(&fs);
     reg.register(ToolDefinition::new("find_files","Find files and folders by name.",json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"max_results":{"type":"integer"}},"required":["pattern"],"additionalProperties":false}),false,Arc::new(move|a: &serde_json::Map<String, Value>|x.find_files(a["pattern"].as_str().unwrap_or(""),a.get("path").and_then(Value::as_str).unwrap_or("."),a.get("max_results").and_then(Value::as_i64).unwrap_or(50)))))?;
+    let x = Arc::clone(&fs);
+    reg.register(ToolDefinition::new("delete_file","Delete one file within the workspace (directories are refused).",json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}),true,Arc::new(move|a: &serde_json::Map<String, Value>|x.delete_file(a["path"].as_str().unwrap_or("")))))?;
+    let x = Arc::clone(&fs);
+    reg.register(ToolDefinition::new("move_file","Move or rename a file or directory within the workspace. Never overwrites an existing destination.",json!({"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"}},"required":["source","destination"],"additionalProperties":false}),true,Arc::new(move|a: &serde_json::Map<String, Value>|x.move_file(a["source"].as_str().unwrap_or(""),a["destination"].as_str().unwrap_or("")))))?;
+    let x = Arc::clone(&fs);
+    reg.register(ToolDefinition::new("create_directory","Create a directory (and missing parents) within the workspace.",json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}),false,Arc::new(move|a: &serde_json::Map<String, Value>|x.create_directory(a["path"].as_str().unwrap_or("")))))?;
     Ok(fs)
 }
 #[cfg(test)]
@@ -524,9 +658,56 @@ mod tests {
         let d = tempdir().unwrap();
         let f = FilesystemSandbox::new(d.path()).unwrap();
         f.write_file("a/b.txt", "hello world").unwrap();
-        assert_eq!(f.read_file("a/b.txt", 100).unwrap(), "hello world");
+        assert_eq!(f.read_file("a/b.txt", 1, 100).unwrap(), "1 | hello world");
         f.edit_file("a/b.txt", "world", "rust").unwrap();
-        assert_eq!(f.read_file("a/b.txt", 100).unwrap(), "hello rust")
+        assert_eq!(f.read_file("a/b.txt", 1, 100).unwrap(), "1 | hello rust")
+    }
+    #[test]
+    fn edit_reports_lines_and_ignores_copied_line_numbers() {
+        let d = tempdir().unwrap();
+        let f = FilesystemSandbox::new(d.path()).unwrap();
+        f.write_file("m.rs", "fn a() {}\nfn b() {\n    1\n}\n").unwrap();
+
+        // Old and new text copied with read_file's "N | " prefixes.
+        let result = f
+            .edit_file("m.rs", " 2 | fn b() {\n 3 |     1", " 2 | fn b() {\n 3 |     2")
+            .unwrap();
+        assert!(result.contains("replaced lines 2-3 with 2 line(s)"), "{result}");
+        assert_eq!(
+            fs::read_to_string(d.path().join("m.rs")).unwrap(),
+            "fn a() {}\nfn b() {\n    2\n}\n"
+        );
+        assert!(f.write_file("n.txt", "a\nb").unwrap().contains("(2 lines)"));
+    }
+    #[test]
+    fn line_number_helpers() {
+        assert_eq!(strip_line_numbers("  9 | a\n 10 |   b").as_deref(), Some("a\n  b"));
+        assert_eq!(strip_line_numbers("3 |"), Some(String::new()));
+        assert!(strip_line_numbers("a | b").is_none());
+        assert!(strip_line_numbers("1 | a\nplain").is_none());
+        assert_eq!(line_of("a\nb\nc", 4), 3);
+        assert_eq!(line_count("a\nb\n"), 2);
+    }
+    #[test]
+    fn read_file_pages_large_files() {
+        let d = tempdir().unwrap();
+        let f = FilesystemSandbox::new(d.path()).unwrap();
+        f.write_file("big.txt", "one\ntwo\nthree\nfour\n").unwrap();
+
+        // Each numbered line costs 4 chars of prefix ("1 | ").
+        let page = f.read_file("big.txt", 1, 17).unwrap();
+        assert!(page.starts_with("1 | one\n2 | two\n"));
+        assert!(page.contains("lines 1-2 of 4"));
+        assert!(page.contains("offset=3"));
+
+        let rest = f.read_file("big.txt", 3, 100).unwrap();
+        assert!(rest.starts_with("3 | three\n4 | four\n"));
+        assert!(rest.contains("lines 3-4 of 4"));
+        assert!(!rest.contains("offset="));
+
+        assert!(f.read_file("big.txt", 9, 100).is_err());
+        f.write_file("empty.txt", "").unwrap();
+        assert!(f.read_file("empty.txt", 1, 100).unwrap().contains("is empty"));
     }
     #[test]
     fn tree_depth() {

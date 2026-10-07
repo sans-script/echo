@@ -1,38 +1,13 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-pub fn list_workspace(workspace: &Path) -> String {
-    let mut entries = match std::fs::read_dir(workspace) {
-        Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
-        Err(err) => return format!("Error listing '{}': {}", workspace.display(), err),
-    };
-
-    entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
-
-    if entries.is_empty() {
-        return "(empty)".into();
+/// Drops the `\\?\` prefix Windows adds to canonical paths, so they display
+/// as typed (`C:\...`). UNC paths are left untouched.
+pub fn display_path(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        _ => path,
     }
-
-    let mut output = String::new();
-
-    for entry in entries {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-
-        match entry.file_type() {
-            Ok(file_type) if file_type.is_dir() => {
-                output.push_str(&format!("[DIR]  {name}\n"));
-            }
-            Ok(_) => {
-                let size = std::fs::metadata(&path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0);
-                output.push_str(&format!("[FILE] {name} ({size} bytes)\n"));
-            }
-            Err(_) => output.push_str(&format!("[?]    {name}\n")),
-        }
-    }
-
-    output.trim_end().into()
 }
 
 pub fn tree_workspace(workspace: &Path, max_depth: usize) -> String {

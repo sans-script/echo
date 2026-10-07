@@ -155,11 +155,29 @@ impl Composer {
         self.force_cursor_visible();
     }
 
+    pub fn insert_str(&mut self, text: &str) {
+        for ch in text.chars() {
+            self.chars.insert(self.cursor, ch);
+            self.cursor += 1;
+        }
+        self.mark_cursor_activity();
+    }
+
     pub fn wrapped_height(&self, width: u16) -> u16 {
         let width = usize::from(width.max(1));
-        let text_width = self.chars.len();
+        // The software cursor can take one extra column at the end of the text.
+        let text = self.text();
+        let lines = text.split('\n').collect::<Vec<_>>();
+        let rows = lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let cursor = usize::from(index + 1 == lines.len());
+                (line.chars().count() + cursor).div_ceil(width).max(1)
+            })
+            .sum::<usize>();
 
-        text_width.div_ceil(width).max(1).min(usize::from(u16::MAX)) as u16
+        rows.max(1).min(usize::from(u16::MAX)) as u16
     }
 
     pub fn visible_with_cursor(&self) -> String {
@@ -215,6 +233,15 @@ mod tests {
 
         composer.delete();
         assert_eq!(composer.text(), "a");
+    }
+
+    #[test]
+    fn height_counts_explicit_line_breaks() {
+        let mut composer = Composer::new();
+        composer.insert_str("one\ntwo\nthree");
+
+        assert_eq!(composer.wrapped_height(80), 3);
+        assert_eq!(composer.wrapped_height(3), 4);
     }
 
     #[test]

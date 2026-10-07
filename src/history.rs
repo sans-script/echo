@@ -132,6 +132,22 @@ impl History {
         self.draft.clear();
     }
 
+    /// Newest entry older than index `before` that contains `query`
+    /// (case-insensitive), for Ctrl+R reverse search.
+    pub fn search(&self, query: &str, before: usize) -> Option<(usize, &str)> {
+        let query = query.to_lowercase();
+        self.entries[..before.min(self.entries.len())]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, entry)| entry.to_lowercase().contains(&query))
+            .map(|(index, entry)| (index, entry.as_str()))
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     #[cfg(test)]
     fn entries(&self) -> &[String] {
         &self.entries
@@ -165,6 +181,20 @@ mod tests {
         assert_eq!(history.previous("second").as_deref(), Some("first"));
         assert_eq!(history.next().as_deref(), Some("second"));
         assert_eq!(history.next().as_deref(), Some("draft"));
+    }
+
+    #[test]
+    fn reverse_search_walks_older_matches() {
+        let mut history = History::new();
+        history.push("list files");
+        history.push("read a.txt");
+        history.push("List the workspace");
+
+        let (newest, text) = history.search("list", history.len()).unwrap();
+        assert_eq!(text, "List the workspace");
+        let (_, older) = history.search("list", newest).unwrap();
+        assert_eq!(older, "list files");
+        assert!(history.search("missing", history.len()).is_none());
     }
 
     #[test]

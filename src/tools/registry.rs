@@ -206,7 +206,10 @@ impl ToolRegistry {
                         Ok(mut result) => {
                             if result.len() > self.max_output_chars {
                                 let total = result.len();
-                                result.truncate(self.max_output_chars);
+                                result.truncate(crate::orchestrator::floor_char_boundary(
+                                    &result,
+                                    self.max_output_chars,
+                                ));
                                 result.push_str(&format!(
                                     "
 ... [Output truncated; total length: {total} characters]"
@@ -422,6 +425,17 @@ mod tests {
         assert!(record.success);
         assert!(record.result.starts_with("\"abc"));
         assert_eq!(registry.execution_history.len(), 1);
+    }
+
+    #[test]
+    fn truncation_respects_multibyte_characters() {
+        let mut registry = ToolRegistry::new(4);
+        registry.register(definition(false, echo)).unwrap();
+
+        let record = registry.execute("call-3", "echo", r#"{"value":"ççç"}"#);
+
+        assert!(record.success);
+        assert!(record.result.starts_with("\"ç"));
     }
 
     #[test]
