@@ -492,6 +492,8 @@ Its main design goals are:
 
 ---
 
+
+
 ## Current Scope
 
 Echo is currently focused on local software-engineering support tasks, particularly:
